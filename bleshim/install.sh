@@ -156,6 +156,13 @@ verify_obc() {
     else
         echo "    MISSING  MyWhooshShim.dll cannot hook the OBC exports (an older build)"; ok=0
     fi
+    if [ -f "$dir/MyWhooshShim.dll" ] && has_name "$dir/MyWhooshShim.dll" "HookBool" \
+       && has_name "$dir/Windows.dll" "WD_InstallDirconServiceAsync"; then
+        echo "    ok       the connection screen's OpenBikeControl icon scans, and its"
+        echo "             'install Dircon/Bonjour' button is refused"
+    else
+        echo "    MISSING  the OpenBikeControl icon offers to install Bonjour (an older build)"; ok=0
+    fi
     for helper in "$dir/blehelper.py" ./blehelper.py; do [ -f "$helper" ] && break; done
     if grep -q '"mdns_browse"' "$helper" 2>/dev/null; then
         echo "    ok       $helper serves mdns_browse"

@@ -86,15 +86,23 @@ caller reading `xmm0` sees no change. The one subtlety is that mono compiles
 these lazily: the first call through a slot replaces it with the compiled
 wrapper, so the stub takes the slot back afterwards.
 
-## OpenBikeControl: two exports that do nothing here
+## OpenBikeControl: exports that assume Bonjour
 
 `OBC_StartScan` and `OBC_StopScan` marshal fine and run fine — and do nothing,
 because the game's OpenBikeControl discovery is Apple Bonjour behind the
-Bonjour gate (`../bleshim/CLAUDE.md`). `HookVoid(name, handler)` points a
-`void()` export at a handler of ours instead, by the same slot replacement; the
-game's own method is not called. `../bleshim/src/Loader.cs` uses it to send both
-to `../bleshim/src/OpenBike.cs`, which discovers devices through avahi instead.
-Every call is wrapped like the others: nothing escapes.
+Bonjour gate (`../bleshim/CLAUDE.md`). Two more stand in the way of the
+connection screen's OpenBikeControl icon: `WD_GetDirconServiceAvailability`
+("is Bonjour installed?"), which the icon asks first, and
+`WD_InstallDirconServiceAsync`, what it offers on "no" — turn the Windows
+firewall off and run the bundled `bonjoursdksetup.exe`, which under Wine opens
+the gate and crashes the game at its next start.
+
+`HookVoid`, `HookBool` and `HookVoidString` point an export of that exact shape
+(`void()`, `bool()`, `void(LPStr)`) at a handler of ours instead, by the same
+slot replacement; the game's own method is not called. `../bleshim/src/Loader.cs`
+sends all four to `../bleshim/src/OpenBike.cs`: the scan exports browse through
+avahi, availability answers yes, the install is refused and logged. Every call
+is wrapped like the others: nothing escapes.
 
 ## What it looks like when it works
 
@@ -103,8 +111,10 @@ Every call is wrapped like the others: nothing escapes.
              ... hooked 4/4 exports
 [exportshim] float returns mirrored into eax: 12/12 -- BT_GetPower,BT_GetCadence,BT_GetHeart,...
 [exportshim] BT_GetConnectedDevicesList -> 3 device(s) at 0x337e6310
-[exportshim] OBC_StopScan: slot 0x1052582a8 … (void, handled by MyWhoosh.Ble.OpenBike.StopScan)
-[exportshim] OBC_StartScan: slot 0x1052582a0 … (void, handled by MyWhoosh.Ble.OpenBike.StartScan)
+[exportshim] WD_InstallDirconServiceAsync: slot … (handled by MyWhoosh.Ble.OpenBike.RefuseInstall)
+[exportshim] OBC_StopScan: slot … (handled by MyWhoosh.Ble.OpenBike.StopScan)
+[exportshim] OBC_StartScan: slot … (handled by MyWhoosh.Ble.OpenBike.StartScan)
+[exportshim] WD_GetDirconServiceAvailability: slot … (handled by MyWhoosh.Ble.OpenBike.ServiceAvailable)
 ```
 
 `hooked 4/4 exports` is the line to look for. Anything less means the stub shape
@@ -115,7 +125,7 @@ on the second line, the missing ones show pointers on the HUD again.
 
 | File | What it is |
 |---|---|
-| `ExportShim.cs` | Finds the slots, replaces them, marshals the arrays, fixes the float returns, hooks `void()` exports (`HookVoid`) |
+| `ExportShim.cs` | Finds the slots, replaces them, marshals the arrays, fixes the float returns, answers exports itself (`HookVoid`, `HookBool`, `HookVoidString`) |
 | `build.sh` | `mcs` → `build/MyWhooshShim.dll` |
 | `install.sh` | Copies it into the prefix's wine-mono tree (`--restore` removes it) |
 

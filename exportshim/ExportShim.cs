@@ -300,79 +300,109 @@ namespace MyWhoosh
         }
 
 
-        // ------------------------------------------------- void() exports
+        // ------------------------------------------- exports we answer ourselves
 
-        /// Point a `void name()` export at `handler` instead of the game's
-        /// method.  For exports whose original does nothing useful here --
-        /// OBC_StartScan and OBC_StopScan are no-ops behind the Bonjour gate,
-        /// and ../bleshim/src/OpenBike.cs does their job without Bonjour.  The
-        /// game's own method is not called.  Returns whether the slot now
-        /// points at the handler; never throws.
+        // Exports whose original is no use under Wine, answered by a handler
+        // of ours: the game's own method is not called.  ../bleshim/src/Loader.cs
+        // uses these for the OpenBikeControl exports (no-ops behind the Bonjour
+        // gate, served by ../bleshim/src/OpenBike.cs), for the Bonjour-presence
+        // query the connection screen asks before it offers OpenBikeControl,
+        // and for the button that would install Bonjour into the prefix.  Each
+        // returns whether the slot now points at the handler, and never throws.
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        delegate bool BoolFn();
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        delegate void AnsiFn(IntPtr text);
+
+        /// `void name()`.
         public static bool HookVoid(string name, Action handler)
+        {
+            if (handler == null) return false;
+            VoidFn fn = () =>
+            {
+                try { handler(); }
+                catch (Exception e) { Log(name + ": " + e.GetType().Name + ": " + e.Message); }
+            };
+            return Redirect(name, typeof(void), new Type[0], fn, handler.Method);
+        }
+
+        /// `bool name()`, marshalled as the original is: a 4-byte BOOL.  On a
+        /// throw it answers false, as if the original had found nothing.
+        public static bool HookBool(string name, Func<bool> handler)
+        {
+            if (handler == null) return false;
+            BoolFn fn = () =>
+            {
+                try { return handler(); }
+                catch (Exception e) { Log(name + ": " + e.GetType().Name + ": " + e.Message); return false; }
+            };
+            return Redirect(name, typeof(bool), new Type[0], fn, handler.Method);
+        }
+
+        /// `void name(string)` whose string is an ANSI char* ([MarshalAs(LPStr)]).
+        public static bool HookVoidString(string name, Action<string> handler)
+        {
+            if (handler == null) return false;
+            AnsiFn fn = p =>
+            {
+                try { handler(p == IntPtr.Zero ? null : Marshal.PtrToStringAnsi(p)); }
+                catch (Exception e) { Log(name + ": " + e.GetType().Name + ": " + e.Message); }
+            };
+            return Redirect(name, typeof(void), new[] { typeof(string) }, fn, handler.Method);
+        }
+
+        /// Point export `name` at `fn`, if the game's method has exactly this
+        /// return type and these parameter types.
+        static bool Redirect(string name, Type ret, Type[] parms, Delegate fn, MethodInfo handler)
         {
             try
             {
-                lock (Gate) return HookVoidCore(name, handler);
+                lock (Gate)
+                {
+                    Type game = FindGameType();
+                    if (game == null) { Log(name + ": " + GameType + " not found; not hooked"); return false; }
+
+                    MethodInfo mi = game.GetMethod(name, BindingFlags.Public | BindingFlags.NonPublic
+                                                         | BindingFlags.Static);
+                    if (mi == null) { Log(name + ": no such managed method"); return false; }
+                    ParameterInfo[] ps = mi.GetParameters();
+                    bool same = mi.ReturnType == ret && ps.Length == parms.Length;
+                    for (int i = 0; same && i < ps.Length; i++) same = ps[i].ParameterType == parms[i];
+                    if (!same)
+                    {
+                        Log(name + ": signature is not what the hook expects, leaving it alone");
+                        return false;
+                    }
+
+                    IntPtr module = GameModule();
+                    if (module == IntPtr.Zero) { Log(name + ": WindowsConnectivity.dll is not loaded"); return false; }
+                    IntPtr stub = GetProcAddress(module, name);
+                    if (stub == IntPtr.Zero) { Log(name + ": not exported"); return false; }
+                    IntPtr slot = DecodeStub(stub, name);
+                    if (slot == IntPtr.Zero) return false;
+
+                    IntPtr thunk = Marshal.GetFunctionPointerForDelegate(fn);
+                    Rooted.Add(fn);
+
+                    IntPtr was = Marshal.ReadIntPtr(slot);
+                    uint old;
+                    bool reprotected = VirtualProtect(slot, (IntPtr)IntPtr.Size, PAGE_READWRITE, out old);
+                    Marshal.WriteIntPtr(slot, thunk);
+                    if (reprotected) VirtualProtect(slot, (IntPtr)IntPtr.Size, old, out old);
+                    if (Marshal.ReadIntPtr(slot) != thunk) { Log(name + ": slot write did not stick"); return false; }
+
+                    Log(name + ": slot 0x" + slot.ToString("x16") + " 0x" + was.ToString("x16")
+                        + " -> 0x" + thunk.ToString("x16") + "  (handled by "
+                        + handler.DeclaringType + "." + handler.Name + ")");
+                    return true;
+                }
             }
             catch (Exception e)
             {
                 Log(name + ": not hooked: " + e);
                 return false;
-            }
-        }
-
-        static bool HookVoidCore(string name, Action handler)
-        {
-            if (handler == null) return false;
-            Type game = FindGameType();
-            if (game == null) { Log(name + ": " + GameType + " not found; not hooked"); return false; }
-
-            MethodInfo mi = game.GetMethod(name, BindingFlags.Public | BindingFlags.NonPublic
-                                                 | BindingFlags.Static);
-            if (mi == null) { Log(name + ": no such managed method"); return false; }
-            if (mi.ReturnType != typeof(void) || mi.GetParameters().Length != 0)
-            {
-                Log(name + ": not void(), leaving it alone");
-                return false;
-            }
-
-            IntPtr module = GameModule();
-            if (module == IntPtr.Zero) { Log(name + ": WindowsConnectivity.dll is not loaded"); return false; }
-            IntPtr stub = GetProcAddress(module, name);
-            if (stub == IntPtr.Zero) { Log(name + ": not exported"); return false; }
-            IntPtr slot = DecodeStub(stub, name);
-            if (slot == IntPtr.Zero) return false;
-
-            var call = new VoidCall(name, handler);
-            VoidFn fn = call.Call;
-            IntPtr thunk = Marshal.GetFunctionPointerForDelegate(fn);
-            Rooted.Add(fn);
-            Rooted.Add(call);
-
-            IntPtr was = Marshal.ReadIntPtr(slot);
-            uint old;
-            bool reprotected = VirtualProtect(slot, (IntPtr)IntPtr.Size, PAGE_READWRITE, out old);
-            Marshal.WriteIntPtr(slot, thunk);
-            if (reprotected) VirtualProtect(slot, (IntPtr)IntPtr.Size, old, out old);
-            if (Marshal.ReadIntPtr(slot) != thunk) { Log(name + ": slot write did not stick"); return false; }
-
-            Log(name + ": slot 0x" + slot.ToString("x16") + " 0x" + was.ToString("x16")
-                + " -> 0x" + thunk.ToString("x16") + "  (void, handled by "
-                + handler.Method.DeclaringType + "." + handler.Method.Name + ")");
-            return true;
-        }
-
-        sealed class VoidCall
-        {
-            readonly string name;
-            readonly Action handler;
-
-            internal VoidCall(string name, Action handler) { this.name = name; this.handler = handler; }
-
-            internal void Call()
-            {
-                try { handler(); }
-                catch (Exception e) { Log(name + ": " + e.GetType().Name + ": " + e.Message); }
             }
         }
 

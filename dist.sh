@@ -48,8 +48,9 @@ cp -f bleshim/build/Windows.dll \
       exportshim/build/MyWhooshShim.dll \
       bleshim/blehelper.py \
       lutris/mywhoosh-ble.sh \
+      lutris/mywhoosh-update.sh \
       "$stage/"
-chmod +x "$stage/blehelper.py" "$stage/mywhoosh-ble.sh"
+chmod +x "$stage/blehelper.py" "$stage/mywhoosh-ble.sh" "$stage/mywhoosh-update.sh"
 
 # The manifest is the only way a user can tell which build they are running:
 # the installer unpacks this into a prefix, where nothing else records where it

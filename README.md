@@ -95,14 +95,38 @@ game is offered the new one and asks again.
 
 ## Playing in a window
 
-MyWhoosh starts fullscreen. For a window, add these to Lutris → *Configure* →
-*Game options* → *Arguments*:
+MyWhoosh starts fullscreen, and goes back to fullscreen from its own saved
+setting even when started in a window. Change the setting itself, with the game
+closed — in
+`<prefix>/drive_c/users/steamuser/AppData/Local/MyWhoosh/Saved/Config/Windows/GameUserSettings.ini`:
 
-```
--windowed -ResX=1920 -ResY=1200
+```ini
+FullscreenMode=2
+LastConfirmedFullscreenMode=2
+PreferredFullscreenMode=2
+ResolutionSizeX=1920
+ResolutionSizeY=1200
 ```
 
-Any size works; remove them to go back to fullscreen.
+(`0` fullscreen, `1` borderless fullscreen, `2` windowed; any size works.)
+Adding `-windowed -ResX=1920 -ResY=1200` to Lutris → *Configure* → *Game
+options* → *Arguments* makes the start windowed as well.
+
+## Updating MyWhoosh
+
+There is no Microsoft Store under Wine to update the game. The install leaves a
+script beside the helper that does what the installer did, with the newest
+Store package:
+
+```bash
+~/Games/mywhoosh/bleshim/mywhoosh-update.sh --check   # is there a newer version?
+~/Games/mywhoosh/bleshim/mywhoosh-update.sh           # download and install it
+```
+
+Quit the game first. Your Wine prefix, settings and the Bluetooth support all
+stay: nothing of this project lives in the game's own files. If an update
+changes the game's connectivity library, the script says so — check that
+Bluetooth and BikeControl still connect after the first launch.
 
 ## Using a phone instead
 

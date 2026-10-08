@@ -293,7 +293,19 @@ hold up the trainer's notifications.
   the connection screen) offers everything again, as a fresh Bonjour browse
   would.
 
-`MYWHOOSH_OBC=0` leaves the two exports unhooked. `TestObc.cs` drives the
+- The connection screen's OpenBikeControl icon first asks
+  `WD_GetDirconServiceAvailability` — `WahooProgram::GetBonjourService`, "is a
+  service named Bonjour Service installed" — and on "no" shows *Dircon Service
+  Unavailable … proceed with installation?* instead of scanning. YES calls
+  `WD_InstallDirconServiceAsync`: `netsh advfirewall set allprofile state off`
+  and the bundled `Content/Libraries/Win64/Dircon/bonjoursdksetup.exe` — which
+  is how a prefix comes to have Bonjour, and with it the startup crash. So
+  availability answers yes (safe: every Bonjour COM path checks
+  `isBonjourEnabled`, read once at startup from the *running* service, never
+  this) and the install is refused and logged, always, even with
+  `MYWHOOSH_OBC=0`.
+
+`MYWHOOSH_OBC=0` leaves the OBC exports and the availability query alone. `TestObc.cs` drives the
 whole path without the game, under wine-mono: discovery, the delegate through
 a native function pointer read back at the engine's offsets, and a TCP session
 decoding the device's messages.

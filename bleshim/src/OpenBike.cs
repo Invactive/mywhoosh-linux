@@ -144,6 +144,35 @@ namespace MyWhoosh.Ble
             catch (Exception e) { Backend.Log("obc: StopScan: " + e); }
         }
 
+        static int availabilityAsked;
+
+        /// The game's WD_GetDirconServiceAvailability: "is Apple Bonjour
+        /// installed?" (WahooProgram::GetBonjourService -- a service of that
+        /// name, in any state).  The connection screen asks it when the
+        /// OpenBikeControl icon is tapped, and on "no" offers to install
+        /// Bonjour instead of scanning.  Bonjour's job is done here without
+        /// Bonjour, so: yes.  Nothing managed trusts this answer -- every
+        /// Bonjour COM path checks isBonjourEnabled, read once at startup --
+        /// so it cannot lead the game into COM.
+        public static bool ServiceAvailable()
+        {
+            if (Interlocked.Increment(ref availabilityAsked) == 1)
+                Backend.Log("obc: game asked WD_GetDirconServiceAvailability -- answering yes,"
+                            + " discovery is served without Bonjour");
+            return true;
+        }
+
+        /// The game's WD_InstallDirconServiceAsync: turn the Windows firewall
+        /// off (`netsh advfirewall set allprofile state off`) and run the
+        /// bundled bonjoursdksetup.exe.  A Bonjour service in the prefix opens
+        /// the Bonjour gate and crashes the game at startup, so: never.
+        public static void RefuseInstall(string path)
+        {
+            Backend.Log("obc: game asked to install Bonjour (" + (path ?? "") + "bonjoursdksetup.exe)"
+                        + " -- refused: under Wine it opens the Bonjour gate and the game crashes at"
+                        + " startup; OpenBikeControl is served without it");
+        }
+
         /// Called once the two exports point here.  If the game had already
         /// called OBC_Initialize by then, it may also have called OBC_StartScan
         /// into the original no-op, and there would be no second call to wait

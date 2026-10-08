@@ -115,12 +115,20 @@ namespace MyWhoosh.Ble
         }
 
         /// Point OBC_StartScan / OBC_StopScan at OpenBike.cs, which discovers
-        /// OpenBikeControl devices without Bonjour.  Its own catch: a failure
-        /// here must not read as the export shim having failed.
+        /// OpenBikeControl devices without Bonjour, and answer the two exports
+        /// around them that assume Bonjour.  Its own catch: a failure here must
+        /// not read as the export shim having failed.
         static void HookOpenBike(Type shim)
         {
             try
             {
+                // Whatever else is on or off: the game's "install Bonjour"
+                // button must not put a Bonjour service into the prefix.
+                MethodInfo hookString = shim.GetMethod("HookVoidString", BindingFlags.Public | BindingFlags.Static);
+                if (hookString != null)
+                    hookString.Invoke(null, new object[] { "WD_InstallDirconServiceAsync",
+                                                           (Action<string>)OpenBike.RefuseInstall });
+
                 if (Environment.GetEnvironmentVariable("MYWHOOSH_OBC") == "0")
                 {
                     Backend.Log("obc: disabled (MYWHOOSH_OBC=0)");
@@ -142,6 +150,13 @@ namespace MyWhoosh.Ble
                     return;
                 }
                 OpenBike.Hooked();
+
+                // The OpenBikeControl icon on the connection screen checks for
+                // Bonjour first, and offers to install it rather than scan.
+                MethodInfo hookBool = shim.GetMethod("HookBool", BindingFlags.Public | BindingFlags.Static);
+                if (hookBool != null)
+                    hookBool.Invoke(null, new object[] { "WD_GetDirconServiceAvailability",
+                                                         (Func<bool>)OpenBike.ServiceAvailable });
             }
             catch (Exception e)
             {

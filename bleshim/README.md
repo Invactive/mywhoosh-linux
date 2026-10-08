@@ -176,6 +176,7 @@ And one thing the prefix must **not** have:
 | The device list crashes on first poll | `../exportshim/` is not installed |
 | The game freezes for ~20 s, again and again | An old build: a connect to a sleeping trainer ran on the game's thread. Update; `MYWHOOSH_BLE_INLINE_CONNECT=1` brings the old behaviour back |
 | BikeControl is never offered | `./blehelper.py --mdns` must list it: same network, BikeControl's network (mDNS) connection on, avahi-daemon running. Then look for `obc:` lines in the log |
+| The OpenBikeControl icon says *Dircon Service Unavailable … proceed with installation?* | An older build. Answer **NO**: YES installs Bonjour into the prefix, and the game then crashes at startup. Current builds answer the icon's check themselves and refuse that install |
 | The "connect?" popup vanished before you could answer | Wait — it comes back within 30 s — or tap the OpenBikeControl icon on the game's connection screen |
 | The game crashes at startup in `OBM_Initialize` (`NotImplementedException`) | Bonjour is installed and running in the prefix; OpenBikeControl does not need it here. `./install.sh --verify` |
 | Lutris is a Flatpak and there is no adapter | The sandbox cannot reach BlueZ; the helper is run on the host instead, and the host needs `dbus-python` and `PyGObject`. `../lutris/README.md` has the detail |

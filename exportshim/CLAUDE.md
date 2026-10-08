@@ -66,15 +66,17 @@ value never came from the decoding path; `ConnectedDevicesData.heartRate` is
 only ever written as 0; and `BT_UpdateSlots` delivers the heart-rate slot
 correctly (the sensor is in `pairedList` and `GetHeart()` answers the BPM).
 
-## `HookVoid`, and why it takes a handler from outside
+## `HookVoid`/`HookBool`/`HookVoidString`, and why they take a handler from outside
 
 The OpenBikeControl handlers need the helper connection, which lives in
 `../bleshim`'s `Windows.dll` — and the helper serves one client, so this
 assembly cannot open a second. Hence a hook that takes an `Action`: `Loader.cs`
-passes `OpenBike.StartScan`/`StopScan` by reflection, after `Install()`. It
-refuses anything that is not `void()` in the game's metadata, and does not call
-the original: behind the Bonjour gate it is a no-op, and before `OBC_Initialize`
-it would dereference a null manager. `OBC_StopScan` is hooked first, and
+passes `OpenBike`'s methods by reflection, after `Install()`. Each refuses an
+export whose metadata is not exactly its shape — the delegate has to marshal
+as the original did: a `bool` return as the default 4-byte BOOL, a string as
+the `LPStr` the metadata declares — and none calls the original: behind the
+Bonjour gate the OBC ones are no-ops (and before `OBC_Initialize` would
+dereference a null manager), and the other two are the problem. `OBC_StopScan` is hooked first, and
 `OBC_StartScan` only if that worked: a scan the game cannot stop would be worse
 than none.
 
