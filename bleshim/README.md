@@ -10,6 +10,12 @@ computer's **own** Bluetooth adapter, through BlueZ — the Linux Bluetooth stac
 No phone, no LAN, no pretending. Your trainer pairs in the game's normal device
 screen and streams power and cadence; a heart-rate strap pairs beside it.
 
+It also gives the game back **OpenBikeControl**: virtual shifting from
+[BikeControl](https://bikecontrol.app) and other OpenBikeControl controllers
+over Wi-Fi, with the gears shown in MyWhoosh's own UI. On Windows that needs
+Apple Bonjour, which does not work under Wine; here the host's avahi-daemon
+finds the device instead.
+
 **Installing it** takes one command and is described in the
 [top-level README](../README.md): the Lutris installer puts all of this in place
 and starts the helper alongside the game. The rest of this file is for working
@@ -57,8 +63,23 @@ from Wine:
 
 ```sh
 ./blehelper.py --list                   # what is advertising right now
+./blehelper.py --mdns                   # which OpenBikeControl apps answer on Wi-Fi
 ./blehelper.py                          # serve BlueZ on 127.0.0.1:27019
 ```
+
+With BikeControl running and connected to your network, a healthy start also
+shows, within a second of the game starting:
+
+```
+[exportshim] OBC_StopScan: slot … (void, handled by MyWhoosh.Ble.OpenBike.StopScan)
+[exportshim] OBC_StartScan: slot … (void, handled by MyWhoosh.Ble.OpenBike.StartScan)
+[bleshim]   obc: hooked after OBC_Initialize, … browsing until the game's OBC_StopScan
+[blehelper] mdns: BikeControl at 192.168.1.19:36870 (BikeControl.local, wlp2s0)
+[bleshim]   obc: handing BikeControl to the game: 192.168.1.19:36870 (BikeControl.local.)
+```
+
+and, once you answer "Yes" to the game's "OpenBikeControl instance was found
+running" popup, `obc: the game is connected to BikeControl`.
 
 ## How it works
 
@@ -89,6 +110,18 @@ shim replaces those four function pointers in memory with managed
 implementations. `src/Loader.cs` starts it from a static constructor, so it is
 in place before the game's first poll.
 
+**4. OpenBikeControl discovery.** The game finds OpenBikeControl devices by
+browsing for them with Apple Bonjour — and only when a Bonjour service is
+running, which under Wine is the one thing that must not be (below). With none,
+its discovery quietly does nothing. So the export shim also points the game's
+`OBC_StartScan`/`OBC_StopScan` at `src/OpenBike.cs`, the helper browses
+`_openbikecontrol._tcp` with avahi-daemon, and each device found is handed to
+the game exactly the way Bonjour's answer would have been. The game then
+connects to it and speaks the protocol itself. If you miss its "connect?"
+popup, it is shown again every 30 s until the game is connected
+(`MYWHOOSH_OBC_REOFFER`, `0` to turn that off; `MYWHOOSH_OBC=0` turns the whole
+thing off).
+
 ```
 MyWhoosh                                        (the game)
    │
@@ -101,6 +134,9 @@ Windows.dll  ── src/ ──►  MyWhooshShim.dll      (both in the prefix's 
    │  one JSON line per message, 127.0.0.1:27019
    ▼
 blehelper.py  ──►  BlueZ (D-Bus)  ──►  your Bluetooth adapter
+              ──►  avahi-daemon  ──►  BikeControl's mDNS answer (Wi-Fi)
+
+MyWhoosh's engine  ── TCP, its own Winsock ──►  BikeControl  (the shifts)
 ```
 
 ## What else the prefix needs
@@ -118,9 +154,11 @@ And one thing the prefix must **not** have:
   `Running`; `OpenBikeManager::OBM_Initialize` and `WahooProgram::.ctor` both
   test it first and skip their initialisers when it is false. With no such
   service the Bonjour path is never entered, and nothing here needs a COM server
-  at all. With one, the game demands Apple's COM objects and dies with a
-  `COMException` out of `OBM_Initialize` if they are missing — before Bluetooth
-  is ever reached.
+  at all. With one, the game demands Apple's COM objects and dies out of
+  `OBM_Initialize` — a `COMException` if they are missing, a
+  `NotImplementedException` from wine-mono's `ComAwareEventInfo` if they are
+  there — before Bluetooth is ever reached. Installing Bonjour to get
+  OpenBikeControl is exactly this; point 4 above does it without.
 
   A fresh prefix has no such service. One that has had Apple's Bonjour or
   iTunes installed into it does. `./install.sh --verify` says which state a
@@ -136,6 +174,10 @@ And one thing the prefix must **not** have:
 | The game reports Bluetooth off | The helper is not reachable, or the adapter is off (`bluetoothctl power on`) |
 | Game exits at startup with `COMException` | A `"Bonjour Service"` is running in the prefix, so the game took the Bonjour path. `./install.sh --verify` |
 | The device list crashes on first poll | `../exportshim/` is not installed |
+| The game freezes for ~20 s, again and again | An old build: a connect to a sleeping trainer ran on the game's thread. Update; `MYWHOOSH_BLE_INLINE_CONNECT=1` brings the old behaviour back |
+| BikeControl is never offered | `./blehelper.py --mdns` must list it: same network, BikeControl's network (mDNS) connection on, avahi-daemon running. Then look for `obc:` lines in the log |
+| The "connect?" popup vanished before you could answer | Wait — it comes back within 30 s — or tap the OpenBikeControl icon on the game's connection screen |
+| The game crashes at startup in `OBM_Initialize` (`NotImplementedException`) | Bonjour is installed and running in the prefix; OpenBikeControl does not need it here. `./install.sh --verify` |
 | Lutris is a Flatpak and there is no adapter | The sandbox cannot reach BlueZ; the helper is run on the host instead, and the host needs `dbus-python` and `PyGObject`. `../lutris/README.md` has the detail |
 
 The log is the diagnostic tool. Every layer writes to it with its own tag —
@@ -149,13 +191,17 @@ got.
 | `src/Windows.cs` | The WinRT surface the game calls: watcher, device, GATT service and characteristic, `Radio`, `DataReader`/`DataWriter` |
 | `src/Backend.cs` | The only thing that knows about the helper: connection, request/response, event dispatch, logging |
 | `src/Json.cs` | A small JSON reader/writer, because wine-mono's framework has none |
-| `src/Loader.cs` | Starts `../exportshim/` from inside the game |
+| `src/Loader.cs` | Starts `../exportshim/` from inside the game, and hooks the OpenBikeControl exports |
+| `src/OpenBike.cs` | OpenBikeControl discovery without Bonjour: browse through the helper, hand each device to the game's own callback |
 | `src/SystemRuntimeWindowsRuntime.cs` | The one member the game needs to `await` a WinRT call |
-| `blehelper.py` | The Linux half: BlueZ over D-Bus, serving one client on loopback |
+| `blehelper.py` | The Linux half: BlueZ and avahi over D-Bus, serving one client on loopback |
 | `TestBle.cs` | Drives the shim the way the game does, without the game |
+| `TestObc.cs` | The same for OpenBikeControl: discovery, the game's callback, a TCP session to the phone |
 | `build.sh` / `install.sh` / `run.sh` | Build, install into a prefix, launch |
 
-`install.sh --verify` says what is currently in a prefix; `--restore` puts the
+`install.sh --verify` says what is currently in a prefix — the in-prefix tree or
+the Lutris layout's `bleshim/`, the Bonjour gate, and each piece OpenBikeControl
+needs, ending with what answers on the network right now; `--restore` puts the
 inert stubs from `../winmd/` back, which turns Bluetooth off again without
 breaking the game.
 
@@ -171,6 +217,23 @@ mono build/TestBle.exe AA:BB:CC:DD:EE:FF --control    # ... and take FTMS contro
 
 Run it under wine-mono as well as the host's Mono — the two runtimes disagree
 about details that only bite inside the prefix. `CLAUDE.md` explains which.
+
+`TestObc.cs` does the same for OpenBikeControl, and only means something under
+wine-mono. Close the game first (BikeControl serves one client), and copy the
+game's `WindowsConnectivity.dll` next to it — a copy; the game's own must stay
+untouched:
+
+```sh
+./blehelper.py --port 27020 &
+cp <game>/WindowsConnectivity.dll build/
+mcs -platform:x64 -out:build/TestObc.exe TestObc.cs src/OpenBike.cs src/Backend.cs src/Json.cs
+MYWHOOSH_BLE_PORT=27020 wine build/TestObc.exe --seconds 30     # press buttons in the app
+MYWHOOSH_BLE_PORT=27020 MYWHOOSH_OBC_REOFFER=5 wine build/TestObc.exe --watch 30
+```
+
+No Mono on the host? `build.sh` falls back to the `mcs.exe` inside a Proton's
+wine-mono, run in a scratch prefix of its own (`../tools/mcs.sh`); in a shell,
+`. ../tools/mcs.sh` gives you the same `mcs`.
 
 ## Going deeper
 

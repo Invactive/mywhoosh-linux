@@ -8,7 +8,7 @@ runs it under Wine and, harder, connects real fitness sensors to it — the game
 
 | Directory | What it is |
 |---|---|
-| `bleshim/` | The Bluetooth stack: a .NET assembly the game loads instead of WinRT, plus a Linux helper speaking BlueZ |
+| `bleshim/` | The Bluetooth stack: a .NET assembly the game loads instead of WinRT, plus a Linux helper speaking BlueZ — and avahi, for OpenBikeControl (BikeControl over Wi-Fi) |
 | `exportshim/` | Replaces game entry points wine-mono marshals wrongly, in memory |
 | `winmd/` | The declaration-only stubs the game needs to start at all — and the "Bluetooth off" state to fall back to |
 | `tools/` | Small programs that read the game's own bytecode; every decision here comes from them |
@@ -46,7 +46,17 @@ assumptions here.
 Bonjour's COM objects — and the `ComAwareEventInfo` that wine-mono does not
 implement — only when the SCM reports a service named exactly `"Bonjour Service"`
 in state `Running`. With no such service, neither is needed and the Bluetooth
-path is all that runs. `bleshim/CLAUDE.md` has the IL.
+path is all that runs. OpenBikeControl, which is what Bonjour is for in this
+game, is served without it: the gate stays shut and `bleshim/src/OpenBike.cs`
+does the discovery through avahi on the Linux side. `bleshim/CLAUDE.md` has the
+IL for both.
+
+**Run Wine in a prefix only with the Wine that made it.** Any other one runs
+`wineboot -u` over the prefix as it starts — a GE-Proton prefix touched by the
+system's wine, or by another Proton, is quietly rewritten for that version.
+`tools/wine.sh` finds the right one from `<prefix>/version`; `tools/mcs.sh`,
+which compiles with wine-mono when the host has no Mono, uses a scratch prefix
+of its own for the same reason.
 
 ## Where to start reading
 

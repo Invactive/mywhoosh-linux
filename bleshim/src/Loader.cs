@@ -110,6 +110,43 @@ namespace MyWhoosh.Ble
 
             Backend.Log("export shim: invoking Install from " + path);
             install.Invoke(null, null);
+
+            HookOpenBike(shim);
+        }
+
+        /// Point OBC_StartScan / OBC_StopScan at OpenBike.cs, which discovers
+        /// OpenBikeControl devices without Bonjour.  Its own catch: a failure
+        /// here must not read as the export shim having failed.
+        static void HookOpenBike(Type shim)
+        {
+            try
+            {
+                if (Environment.GetEnvironmentVariable("MYWHOOSH_OBC") == "0")
+                {
+                    Backend.Log("obc: disabled (MYWHOOSH_OBC=0)");
+                    return;
+                }
+                MethodInfo hook = shim.GetMethod("HookVoid", BindingFlags.Public | BindingFlags.Static);
+                if (hook == null)
+                {
+                    Backend.Log("obc: " + ShimType + " has no HookVoid (an older " + ShimAssembly
+                                + "?); OpenBikeControl stays off");
+                    return;
+                }
+                // Stop first: a scan the game cannot stop would be worse than
+                // none at all.
+                if (!(bool)hook.Invoke(null, new object[] { "OBC_StopScan", (Action)OpenBike.StopScan })
+                    || !(bool)hook.Invoke(null, new object[] { "OBC_StartScan", (Action)OpenBike.StartScan }))
+                {
+                    Backend.Log("obc: exports not hooked; OpenBikeControl stays off");
+                    return;
+                }
+                OpenBike.Hooked();
+            }
+            catch (Exception e)
+            {
+                Backend.Log("obc: not started (" + e.Message + ")");
+            }
         }
 
         static bool GameIsLoaded()

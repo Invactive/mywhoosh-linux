@@ -86,6 +86,16 @@ caller reading `xmm0` sees no change. The one subtlety is that mono compiles
 these lazily: the first call through a slot replaces it with the compiled
 wrapper, so the stub takes the slot back afterwards.
 
+## OpenBikeControl: two exports that do nothing here
+
+`OBC_StartScan` and `OBC_StopScan` marshal fine and run fine — and do nothing,
+because the game's OpenBikeControl discovery is Apple Bonjour behind the
+Bonjour gate (`../bleshim/CLAUDE.md`). `HookVoid(name, handler)` points a
+`void()` export at a handler of ours instead, by the same slot replacement; the
+game's own method is not called. `../bleshim/src/Loader.cs` uses it to send both
+to `../bleshim/src/OpenBike.cs`, which discovers devices through avahi instead.
+Every call is wrapped like the others: nothing escapes.
+
 ## What it looks like when it works
 
 ```
@@ -93,6 +103,8 @@ wrapper, so the stub takes the slot back afterwards.
              ... hooked 4/4 exports
 [exportshim] float returns mirrored into eax: 12/12 -- BT_GetPower,BT_GetCadence,BT_GetHeart,...
 [exportshim] BT_GetConnectedDevicesList -> 3 device(s) at 0x337e6310
+[exportshim] OBC_StopScan: slot 0x1052582a8 … (void, handled by MyWhoosh.Ble.OpenBike.StopScan)
+[exportshim] OBC_StartScan: slot 0x1052582a0 … (void, handled by MyWhoosh.Ble.OpenBike.StartScan)
 ```
 
 `hooked 4/4 exports` is the line to look for. Anything less means the stub shape
@@ -103,7 +115,7 @@ on the second line, the missing ones show pointers on the HUD again.
 
 | File | What it is |
 |---|---|
-| `ExportShim.cs` | Finds the slots, replaces them, marshals the arrays, fixes the float returns |
+| `ExportShim.cs` | Finds the slots, replaces them, marshals the arrays, fixes the float returns, hooks `void()` exports (`HookVoid`) |
 | `build.sh` | `mcs` → `build/MyWhooshShim.dll` |
 | `install.sh` | Copies it into the prefix's wine-mono tree (`--restore` removes it) |
 

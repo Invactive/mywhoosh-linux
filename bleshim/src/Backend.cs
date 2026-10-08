@@ -34,13 +34,17 @@ namespace MyWhoosh.Ble
     /// reported it.  Deliberately flat: this is a transport type, not a model.
     class BackendEvent
     {
-        public string Kind;                 // "advert" | "value" | "connection"
+        public string Kind;                 // "advert" | "value" | "connection" | "mdns" | "mdns_lost"
         public string Address;              // "AA:BB:CC:DD:EE:FF"
         public string Name;                 // advert only, may be empty
         public List<string> Uuids;          // advert only
         public string Characteristic;       // value only
         public byte[] Value;                // value only
         public bool Connected;              // connection only
+        public string ServiceType;          // mdns, mdns_lost: "_openbikecontrol._tcp"
+        public string Host;                 // mdns only: "BikeControl.local"
+        public string Ip;                   // mdns only: IPv4, dotted
+        public int Port;                    // mdns only
     }
 
     static class Backend
@@ -52,12 +56,30 @@ namespace MyWhoosh.Ble
         // and that wait is bounded on its side), short enough that a helper
         // that died does not hang the game's UI thread forever.
         const int CallTimeoutMs = 40000;
+        /// How long the game's own thread may wait on the helper.
+        public const int GameThreadTimeoutMs = 1500;
+        static List<KeyValuePair<string, bool>> lastRadios;
 
         static readonly object Gate = new object();
         static TcpClient client;
         static StreamWriter writer;
         static Thread reader, dispatcher;
         static int nextId;
+        static int generation;              // bumped on every new helper connection
+        static bool saidBusy;               // CallWithin gave up; said so once
+        [ThreadStatic] static bool timedOut;
+
+        /// Whether the helper is still working on an earlier request.  It takes
+        /// them one at a time, so anything asked now waits behind that one.
+        public static bool Busy { get { lock (Gate) return Waiting.Count > 0; } }
+
+        /// How long the game's thread should wait for the helper right now:
+        /// not at all while it is busy, briefly otherwise.
+        public static int GameThreadWait { get { return Busy ? 0 : GameThreadTimeoutMs; } }
+
+        /// Whether this thread's last call gave up waiting, rather than being
+        /// refused -- the request may well still succeed.
+        public static bool LastCallTimedOut { get { return timedOut; } }
         static DateTime nextAttempt;        // do not retry a missing helper on every call
         static bool announcedMissing;       // ... and do not say so on every retry either
         static readonly Dictionary<int, Pending> Waiting = new Dictionary<int, Pending>();
@@ -130,6 +152,7 @@ namespace MyWhoosh.Ble
                         dispatcher.Start();
                     }
                     announcedMissing = false;
+                    generation++;
                     Log("connected to blehelper on 127.0.0.1:" + port);
                     return true;
                 }
@@ -164,6 +187,11 @@ namespace MyWhoosh.Ble
             }
         }
 
+        /// Which helper connection this is.  Anything the helper holds on the
+        /// shim's behalf -- a scan, a subscription, an mDNS browse -- died with
+        /// the previous one, and a caller that compares this can ask again.
+        public static int Generation { get { lock (Gate) return generation; } }
+
         // ------------------------------------------------------------ calls
 
         /// Send one request and wait for its reply.  Returns null when the
@@ -171,6 +199,17 @@ namespace MyWhoosh.Ble
         /// are WinRT methods that must never throw into the game.
         public static Dictionary<string, object> Call(params object[] pairs)
         {
+            return CallWithin(CallTimeoutMs, pairs);
+        }
+
+        /// Call, for a caller that must not be held up: the game's own thread.
+        /// The helper is single-threaded, and a connect to a trainer that is
+        /// asleep keeps it busy for 20 s -- so a radio check or a scan request
+        /// made meanwhile gives up waiting after timeoutMs.  The request still
+        /// goes out, and the helper still carries it out, in order.
+        public static Dictionary<string, object> CallWithin(int timeoutMs, params object[] pairs)
+        {
+            timedOut = false;
             if (!Available) return null;
 
             int id;
@@ -203,12 +242,19 @@ namespace MyWhoosh.Ble
                 return null;
             }
 
-            if (!pending.Done.WaitOne(CallTimeoutMs))
+            if (!pending.Done.WaitOne(timeoutMs))
             {
+                timedOut = true;
                 lock (Gate) Waiting.Remove(id);
-                Log("timeout after " + CallTimeoutMs + "ms: " + line);
+                if (timeoutMs >= CallTimeoutMs) Log("timeout after " + timeoutMs + "ms: " + line);
+                else if (!saidBusy)
+                {
+                    saidBusy = true;
+                    Log("helper busy, not waiting more than " + timeoutMs + "ms for: " + line);
+                }
                 return null;
             }
+            saidBusy = false;
 
             var reply = pending.Reply;
             if (reply == null) return null;
@@ -266,6 +312,10 @@ namespace MyWhoosh.Ble
                 Name = Json.Str(msg, "name", ""),
                 Characteristic = Json.Str(msg, "char"),
                 Connected = Json.Bool(msg, "connected"),
+                ServiceType = Json.Str(msg, "type"),
+                Host = Json.Str(msg, "host", ""),
+                Ip = Json.Str(msg, "ip", ""),
+                Port = (int)Json.Num(msg, "port", 0),
             };
             string hex = Json.Str(msg, "value");
             if (hex != null)
@@ -333,14 +383,25 @@ namespace MyWhoosh.Ble
         public static List<KeyValuePair<string, bool>> Radios()
         {
             var found = new List<KeyValuePair<string, bool>>();
-            var reply = Call("op", "radios");
-            if (reply == null) return found;
+            // Asked on the game's thread (BT_GetModuleState).  A helper busy
+            // connecting answers late, and late must not read as "no
+            // Bluetooth": the last answer stands in until it does.
+            lock (Gate)
+                if (Waiting.Count > 0 && lastRadios != null) return new List<KeyValuePair<string, bool>>(lastRadios);
+            var reply = CallWithin(GameThreadTimeoutMs, "op", "radios");
+            if (reply == null)
+            {
+                lock (Gate)
+                    if (client != null && lastRadios != null) return new List<KeyValuePair<string, bool>>(lastRadios);
+                return found;
+            }
             foreach (object entry in Json.Arr(reply, "radios"))
             {
                 var o = Json.Obj(entry);
                 string name = Json.Str(o, "name");
                 if (name != null) found.Add(new KeyValuePair<string, bool>(name, Json.Bool(o, "powered")));
             }
+            lock (Gate) lastRadios = new List<KeyValuePair<string, bool>>(found);
             return found;
         }
 

@@ -89,6 +89,15 @@ objs = dbus.SystemBus().get_object("org.bluez", "/").GetManagedObjects(
 sys.exit(0 if "/org/bluez/" + sys.argv[1] in objs else 1)
 '
 
+# avahi-daemon, which finds OpenBikeControl devices (BikeControl over Wi-Fi)
+# for the game -- see blehelper.py's Avahi class.  Optional: Bluetooth does not
+# need it, so its absence is a note, not a failure.
+AVAHI_PROBE='
+import dbus
+dbus.Interface(dbus.SystemBus().get_object("org.freedesktop.Avahi", "/"),
+               "org.freedesktop.Avahi.Server").GetVersionString()
+'
+
 # Both at install time and at launch: the same questions, asked of the machine
 # rather than of the user.
 deps_report() {
@@ -136,6 +145,14 @@ deps_report() {
         say "      check with:  bluetoothctl list  /  bluetoothctl power on"
         say "      another adapter: set MYWHOOSH_BLE_ADAPTER in Lutris' environment variables"
         ok=1
+    fi
+
+    if $HOST python3 -c "$AVAHI_PROBE" 2>/dev/null; then
+        say "ok    avahi-daemon (BikeControl / OpenBikeControl over Wi-Fi)"
+    else
+        say "note  no avahi-daemon -- Bluetooth is unaffected, but OpenBikeControl"
+        say "      apps such as BikeControl will not be found over Wi-Fi"
+        say "      Debian/Ubuntu: sudo apt install avahi-daemon   (Fedora/Arch: avahi)"
     fi
 
     return $ok

@@ -130,12 +130,37 @@ caught error. Every entry point catches. `Loader.Kick()` in particular is called
 from static constructors, where a throw would take the whole type — and with it
 the BLE path — down.
 
-## Two rules inside the shim
+## Rules inside the shim
 
-**Every `IAsyncOperation` completes inline.** `BluetoothProgram::IsBluetoothEnabled`
-awaits and then `Task.Wait()`s on the same thread; anything that actually defers
-deadlocks the game at startup. `src/Windows.cs` wraps `Task.FromResult` — the
-work has already happened by the time the operation is handed back.
+**Every `IAsyncOperation` completes inline — except the connect.**
+`BluetoothProgram::IsBluetoothEnabled` calls `CheckRadioState()` and then
+`Task.Wait()`s on it, on the game's thread, so the radio query must already be
+finished when it is handed back; `src/Windows.cs` wraps `Task.FromResult`.
+
+`BluetoothLEDevice.FromBluetoothAddressAsync` is the exception, and it has to
+be. It is where the helper connects, which takes up to 20 s for a trainer that
+is asleep (`ADVERT_TIMEOUT`), and the game calls it from its own thread: the
+auto-connect after a profile is chosen (`AutoConnectFunc` → `BluetoothSensor::Connect`)
+and the pairing screen (`ConnectDevice` → `PairDevice`). Both go through
+`ExtensionMethods::Await`, which is `async void` — on Windows the call returns
+at once and the rest runs on WinRT's threads. Completed inline, it froze the
+game for the whole wait, every ~25 s while the saved trainer slept; fullscreen,
+that looks like the whole desktop hanging. The IL settles that deferring it is
+safe: all eight WinRT call sites in `WindowsConnectivity.dll` are consumed by
+`await` through `WindowsRuntimeSystemExtensions::GetAwaiter`, and the radio
+check is the only `Task.Wait` in the assembly. So the connect runs on a pool
+thread and the game's connect sequence continues there, as on Windows.
+`MYWHOOSH_BLE_INLINE_CONNECT=1` restores the old behaviour.
+
+**The game's thread never waits long for the helper.** The helper is
+single-threaded, so while it connects, everything else queues behind it —
+including the radio query (`BT_GetModuleState` → `IsBluetoothEnabled`) and scan
+start/stop, which come from the game's thread. `Backend.CallWithin` bounds the
+wait (`GameThreadTimeoutMs`, and zero while another request is outstanding);
+the request still goes out and is still carried out, in order. Radios answer
+from the last reply meanwhile — never empty, which the game reads as
+"Bluetooth off" — and a scan that merely timed out is not reported as stopped
+(`Backend.LastCallTimedOut`).
 
 **Events arrive on the shim's dispatcher thread**, which is not a thread the
 game created. This was the risk named before any of it was written and it turns
@@ -147,8 +172,13 @@ rather than an exception, so it is worth remembering when one appears.
 Newline-delimited JSON on `127.0.0.1:27019`, one client at a time.
 
 - Requests carry `id` and `op`: `radios`, `scan`, `connect`, `disconnect`,
-  `services`, `chars`, `read`, `write`, `notify`. Replies carry the same `id`.
-- Unsolicited events carry `event`: `advert`, `value`, `connection`.
+  `services`, `chars`, `read`, `write`, `notify`, and for OpenBikeControl
+  `mdns_browse` (`type`, `enable`) and `tcp_peer` (`ip`, `port` → `connected`).
+  Replies carry the same `id`.
+- Unsolicited events carry `ev`: `advert`, `value`, `connection`, `mdns`
+  (`type`, `name`, `host`, `ip`, `port`, `iface`, `txt`) and `mdns_lost`.
+- The helper serves requests one at a time, in order; a `connect` can hold it
+  for 20 s (see the rules above).
 - The shim connects lazily and retries every 5 s, so starting the helper after
   the game still works.
 
@@ -186,7 +216,10 @@ So with no `"Bonjour Service"` running:
 - `ComAwareEventInfo` is never constructed, so it does not matter that wine-mono
   leaves all of it as `NotImplementedException`;
 - `WD_GetDirconServiceAvailability` returns false and the game simply does not
-  offer Direct Connect, which here is correct.
+  offer Direct Connect, which here is correct;
+- `OBM_Initialize`/`OBM_StartScan` do nothing, so the game would find no
+  OpenBikeControl devices — which is why the next section exists. It keeps
+  the gate shut and does the discovery itself.
 
 A fresh prefix has no such service, so this costs nothing. A prefix that has had
 Apple's Bonjour installed into it — by iTunes, or deliberately — makes the
@@ -194,7 +227,83 @@ Bluetooth path appear to require a COM server and a patched runtime, and that
 appearance is entirely an artefact of the service. `./install.sh --verify`
 reports the gate state; the service is not ours and the script never removes it.
 
+## OpenBikeControl, without Bonjour
+
+OpenBikeControl is how BikeControl (and a KICKR BIKE PRO, and others) send
+virtual shifts to the game over Wi-Fi: the device advertises
+`_openbikecontrol._tcp` over mDNS, the app connects over TCP and reads button
+messages. Spec: [openbikecontrol-protocol](https://github.com/OpenBikeControl/openbikecontrol-protocol)
+(`MDNS.md`, `PROTOCOL.md`).
+
+**What the IL says lives where.** Only discovery is in `WindowsConnectivity.dll`:
+
+| | |
+|---|---|
+| `OBC_Initialize(OpenBikeDataDelegate)` | `new OpenBikeManager` (constructor: the gate check), `OBM_Initialize`, store the delegate in `DelegateCallbacks.OpenBikeDataCallback` |
+| `OBC_StartScan` / `OBC_StopScan` | `OBM_StartScan`: a fresh Bonjour `Browse("_openbikecontrol._tcp.")` *on every call* / `browser.Stop()` |
+| `ServiceFound` | `Resolve(...)` |
+| `ServiceResolved` | `Dns.GetHostAddressesAsync(hostname)`, first `InterNetwork` address whose text is ≥ 5 characters, `FOpenBikeDataStruct{ipAddress, hostName, port}`, `OpenBikeDataCallback.Invoke` |
+| `ServiceLost` | `ret` — the game is never told |
+| `OperationFailed` | `throw new NotImplementedException()` |
+
+The TCP connection and the protocol are the engine's: `MyWhoosh-Win64-Shipping.exe`
+has `UOpenBikeController::ConnectToOpenBike`, `OnOpenBikeMessageReceived`,
+`CheckOpenBikeSocketConnection`, `EVirtualGears::E_Gear1..30` and the popup text
+"OpenBikeControl instance was found running. Would you like to connect to the
+instance?". It uses Winsock, which works under Wine unchanged. So the shim
+needs no TCP client and no protocol code — a second client would only compete
+with the engine's, and BikeControl serves one.
+
+**The marshalling shape**, measured under wine-mono: `OpenBikeDataDelegate` is
+`void(FOpenBikeDataStruct)`, by value, no `UnmanagedFunctionPointer`; the struct
+is `Sequential, CharSet=Unicode`, 24 bytes — `LPWStr ipAddress @0`,
+`int port @8`, `LPWStr hostName @16`. `hostName` comes from argument 5 of the
+Bonjour handler (the SRV target, a BSTR with the trailing dot), `port` from
+argument 6 (`ushort`). Managed-to-native, struct by value with strings: the same
+shape as `ConnectDelegate`, which the Bluetooth path already uses.
+
+**What replaces Bonjour.** `../exportshim` points the two `void()` exports
+`OBC_StartScan` / `OBC_StopScan` at `src/OpenBike.cs` (`ExportShim.HookVoid`,
+wired from `src/Loader.cs`). `OBC_Initialize` is left alone: with the gate shut
+it does nothing but store the delegate, which is what is needed.
+`blehelper.py` browses with avahi-daemon — on the Linux side, because avahi
+already owns UDP 5353 there — and follows each service with a persistent
+`ServiceResolver`, so a phone that changes address, or an app that comes back
+on another port (BikeControl walks to the next free one: 36868, 36870, …), is
+reported again. `OpenBike.cs` fills the game's own struct by reflection,
+exactly as `ServiceResolved` does, and calls the game's own delegate object —
+so mono marshals it through the same wrapper. On its own thread: the original
+runs on Bonjour's event thread, and the engine's callback must not be able to
+hold up the trainer's notifications.
+
+**Things measured in the game:**
+
+- The game calls `OBC_Initialize` and `OBC_StartScan` at startup, *before*
+  `Loader.Kick` has hooked anything, and never calls `OBC_StopScan` in a normal
+  session. `OpenBike.Hooked` therefore starts browsing when it finds the
+  delegate already set.
+- The engine connects to `ipAddress`; nothing was seen resolving `hostName`.
+- The engine's popup times out within seconds, and the first offer lands among
+  the game's own startup popups, so it is easy to miss. This is the one
+  deliberate departure from the original: while the game has no TCP connection
+  to a service, it is offered again every `MYWHOOSH_OBC_REOFFER` seconds
+  (default 30, `0` = never), at most 20 times in a row. The helper's `tcp_peer`
+  reads the engine's socket out of `/proc/net/tcp` — Winsock under Wine is a
+  plain Linux socket. A repeated `OBC_StartScan` (the OpenBikeControl icon on
+  the connection screen) offers everything again, as a fresh Bonjour browse
+  would.
+
+`MYWHOOSH_OBC=0` leaves the two exports unhooked. `TestObc.cs` drives the
+whole path without the game, under wine-mono: discovery, the delegate through
+a native function pointer read back at the engine's offsets, and a TCP session
+decoding the device's messages.
+
 ## Open
+
+**OpenBikeControl under Flatpak is unridden.** The helper already runs on the
+host there, and avahi is on the host's system bus, so it should hold; `tcp_peer`
+assumes the game shares the host's network namespace, which Flatpak's
+`--share=network` gives.
 
 **Only the pieces have been verified on a clean install, not the whole.** The
 Lutris installer's file steps were dry-run through Lutris' own `CommandsMixin`

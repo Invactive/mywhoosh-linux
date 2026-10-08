@@ -66,6 +66,18 @@ value never came from the decoding path; `ConnectedDevicesData.heartRate` is
 only ever written as 0; and `BT_UpdateSlots` delivers the heart-rate slot
 correctly (the sensor is in `pairedList` and `GetHeart()` answers the BPM).
 
+## `HookVoid`, and why it takes a handler from outside
+
+The OpenBikeControl handlers need the helper connection, which lives in
+`../bleshim`'s `Windows.dll` — and the helper serves one client, so this
+assembly cannot open a second. Hence a hook that takes an `Action`: `Loader.cs`
+passes `OpenBike.StartScan`/`StopScan` by reflection, after `Install()`. It
+refuses anything that is not `void()` in the game's metadata, and does not call
+the original: behind the Bonjour gate it is a no-op, and before `OBC_Initialize`
+it would dereference a null manager. `OBC_StopScan` is hooked first, and
+`OBC_StartScan` only if that worked: a scan the game cannot stop would be worse
+than none.
+
 ## Two details that are deliberate
 
 **Nothing may escape.** These run as native-to-managed thunks, where an

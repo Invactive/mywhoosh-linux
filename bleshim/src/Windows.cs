@@ -75,6 +75,25 @@ namespace Windows.Foundation
         {
             Task = System.Threading.Tasks.Task.FromResult(result);
         }
+
+        /// An operation that really is asynchronous: the work runs on a pool
+        /// thread and the caller's `await` returns at once, as WinRT's does.
+        /// Only for calls the game consumes with `await` alone -- see
+        /// BluetoothLEDevice.FromBluetoothAddressAsync.  Never faults: a
+        /// failure is the default result, which is how every operation here
+        /// reports one.
+        internal IAsyncOperation(Func<TResult> work, string what)
+        {
+            Task = System.Threading.Tasks.Task.Run(() =>
+            {
+                try { return work(); }
+                catch (Exception e)
+                {
+                    Backend.Log(what + " failed: " + e.Message);
+                    return default(TResult);
+                }
+            });
+        }
     }
 
     public delegate void TypedEventHandler<TSender, TResult>(TSender sender, TResult args);
@@ -274,14 +293,36 @@ namespace Windows.Devices.Bluetooth
         /// before the link is up and the services have resolved.  A device that
         /// cannot be reached comes back as null, which is what the game handles
         /// on Windows for a sensor that has gone away.
+        ///
+        /// It is also the one operation that is not finished when it is handed
+        /// back.  A connect can take 20 s -- that is how long the helper waits
+        /// for a trainer that is asleep -- and the game calls it from its own
+        /// thread, on the auto-connect after a profile is chosen
+        /// (BluetoothProgram::AutoConnectFunc) and from the pairing screen
+        /// (ConnectDevice), both through ExtensionMethods::Await, which is
+        /// `async void`: on Windows the call returns at once and the rest of
+        /// the connect runs on WinRT's threads.  Completing it inline here froze
+        /// the game for the whole wait.  Nothing in WindowsConnectivity.dll
+        /// blocks on this result -- its only Task.Wait is on the radio check --
+        /// so it can complete on a pool thread, and the rest of the game's
+        /// connect sequence continues there, as on Windows.
+        /// MYWHOOSH_BLE_INLINE_CONNECT=1 restores the old inline behaviour.
         public static IAsyncOperation<BluetoothLEDevice> FromBluetoothAddressAsync(ulong address)
+        {
+            if (Environment.GetEnvironmentVariable("MYWHOOSH_BLE_INLINE_CONNECT") == "1")
+                return new IAsyncOperation<BluetoothLEDevice>(Connect(address));
+            return new IAsyncOperation<BluetoothLEDevice>(() => Connect(address),
+                                                          "connect to " + Addresses.ToMac(address));
+        }
+
+        static BluetoothLEDevice Connect(ulong address)
         {
             string mac = Addresses.ToMac(address);
             var reply = Backend.Call("op", "connect", "addr", mac);
             if (reply == null)
             {
                 Backend.Log("connect to " + mac + " failed");
-                return new IAsyncOperation<BluetoothLEDevice>(null);
+                return null;
             }
 
             string deviceName = Json.Str(reply, "name", string.Empty);
@@ -300,7 +341,7 @@ namespace Windows.Devices.Bluetooth
                 }
             }
             Backend.Log("connected to " + mac + " (" + deviceName + ")");
-            return new IAsyncOperation<BluetoothLEDevice>(device);
+            return device;
         }
 
         public IAsyncOperation<GattDeviceServicesResult> GetGattServicesAsync(BluetoothCacheMode cacheMode)
@@ -465,7 +506,8 @@ namespace Windows.Devices.Bluetooth.Advertisement
                 Running.Add(this);
                 if (Running.Count > 1) return;
             }
-            if (Backend.Call("op", "scan", "enable", true) == null)
+            if (Backend.CallWithin(Backend.GameThreadWait, "op", "scan", "enable", true) == null
+                && !Backend.LastCallTimedOut)
             {
                 Backend.Log("scan could not be started");
                 RaiseStopped();
@@ -480,7 +522,7 @@ namespace Windows.Devices.Bluetooth.Advertisement
                 if (!Running.Remove(this)) return;
                 last = Running.Count == 0;
             }
-            if (last) Backend.Call("op", "scan", "enable", false);
+            if (last) Backend.CallWithin(Backend.GameThreadWait, "op", "scan", "enable", false);
             RaiseStopped();
         }
 

@@ -76,6 +76,34 @@ most common reason a device does not show up.
 Several sensors at once are fine (a trainer and a heart-rate strap, say); each
 gets its own connection.
 
+## Virtual shifting with BikeControl (OpenBikeControl)
+
+[BikeControl](https://bikecontrol.app) turns a Zwift Click/Play/Ride, a game
+controller or similar into virtual gear shifts, and MyWhoosh shows those gears
+in its own UI. On Windows this needs Apple Bonjour; here it works without it.
+
+1. In BikeControl, choose MyWhoosh as the trainer app and enable its network
+   (OpenBikeControl) connection, on the same Wi-Fi as your computer.
+2. Start MyWhoosh. Within seconds it asks *"OpenBikeControl instance was found
+   running. Would you like to connect?"* — answer **Yes**.
+3. Missed it? It comes back within 30 seconds, or tap the OpenBikeControl icon
+   on the game's connection screen.
+
+Your computer needs `avahi-daemon` running (standard on most desktops; the
+install check tells you). If the phone or the computer changes address, the
+game is offered the new one and asks again.
+
+## Playing in a window
+
+MyWhoosh starts fullscreen. For a window, add these to Lutris → *Configure* →
+*Game options* → *Arguments*:
+
+```
+-windowed -ResX=1920 -ResY=1200
+```
+
+Any size works; remove them to go back to fullscreen.
+
 ## Using a phone instead
 
 If you would rather bridge your sensors from a phone, the **MyWhoosh Link**
@@ -100,8 +128,8 @@ they change.
 | Directory | What it is |
 |---|---|
 | [`lutris/`](lutris/README.md) | The Lutris installers, and the script that runs the helper beside the game |
-| [`bleshim/`](bleshim/README.md) | The Bluetooth support: the library the game loads, plus the Linux helper that speaks to BlueZ |
-| [`exportshim/`](exportshim/README.md) | Four game entry points Wine's .NET runtime cannot handle, replaced in memory |
+| [`bleshim/`](bleshim/README.md) | The Bluetooth support: the library the game loads, plus the Linux helper that speaks to BlueZ — and finds BikeControl over Wi-Fi |
+| [`exportshim/`](exportshim/README.md) | Game entry points Wine's .NET runtime cannot handle — or that need Bonjour — replaced in memory |
 | [`winmd/`](winmd/README.md) | The same library with Bluetooth switched off — what the game needs just to start |
 | [`tools/`](tools/README.md) | Small programs that read the game's own code, so decisions here are based on it |
 | [`patch/`](patch/README.md) | An older, launch-only approach, kept for reference |

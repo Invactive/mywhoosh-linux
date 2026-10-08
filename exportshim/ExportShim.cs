@@ -110,6 +110,9 @@ namespace MyWhoosh
         [UnmanagedFunctionPointer(CallingConvention.StdCall)]
         delegate int GetListFn(IntPtr ppDevices);
 
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        delegate void VoidFn();
+
         static readonly object Gate = new object();
         static bool installed;
         // GetFunctionPointerForDelegate does not root the delegate, and a
@@ -139,8 +142,7 @@ namespace MyWhoosh
             Type game = FindGameType();
             if (game == null) { Log("FATAL: " + GameType + " not found; nothing hooked"); return; }
 
-            IntPtr module = GetModuleHandleW("WindowsConnectivity.dll");
-            if (module == IntPtr.Zero) module = GetModuleHandleW("WindowsConnectivity");
+            IntPtr module = GameModule();
             if (module == IntPtr.Zero) { Log("FATAL: WindowsConnectivity.dll is not loaded"); return; }
             Log("module at 0x" + module.ToString("x16"));
 
@@ -289,6 +291,90 @@ namespace MyWhoosh
         }
 
         static IntPtr Offset(IntPtr p, int by) { return new IntPtr(p.ToInt64() + by); }
+
+        static IntPtr GameModule()
+        {
+            IntPtr module = GetModuleHandleW("WindowsConnectivity.dll");
+            if (module == IntPtr.Zero) module = GetModuleHandleW("WindowsConnectivity");
+            return module;
+        }
+
+
+        // ------------------------------------------------- void() exports
+
+        /// Point a `void name()` export at `handler` instead of the game's
+        /// method.  For exports whose original does nothing useful here --
+        /// OBC_StartScan and OBC_StopScan are no-ops behind the Bonjour gate,
+        /// and ../bleshim/src/OpenBike.cs does their job without Bonjour.  The
+        /// game's own method is not called.  Returns whether the slot now
+        /// points at the handler; never throws.
+        public static bool HookVoid(string name, Action handler)
+        {
+            try
+            {
+                lock (Gate) return HookVoidCore(name, handler);
+            }
+            catch (Exception e)
+            {
+                Log(name + ": not hooked: " + e);
+                return false;
+            }
+        }
+
+        static bool HookVoidCore(string name, Action handler)
+        {
+            if (handler == null) return false;
+            Type game = FindGameType();
+            if (game == null) { Log(name + ": " + GameType + " not found; not hooked"); return false; }
+
+            MethodInfo mi = game.GetMethod(name, BindingFlags.Public | BindingFlags.NonPublic
+                                                 | BindingFlags.Static);
+            if (mi == null) { Log(name + ": no such managed method"); return false; }
+            if (mi.ReturnType != typeof(void) || mi.GetParameters().Length != 0)
+            {
+                Log(name + ": not void(), leaving it alone");
+                return false;
+            }
+
+            IntPtr module = GameModule();
+            if (module == IntPtr.Zero) { Log(name + ": WindowsConnectivity.dll is not loaded"); return false; }
+            IntPtr stub = GetProcAddress(module, name);
+            if (stub == IntPtr.Zero) { Log(name + ": not exported"); return false; }
+            IntPtr slot = DecodeStub(stub, name);
+            if (slot == IntPtr.Zero) return false;
+
+            var call = new VoidCall(name, handler);
+            VoidFn fn = call.Call;
+            IntPtr thunk = Marshal.GetFunctionPointerForDelegate(fn);
+            Rooted.Add(fn);
+            Rooted.Add(call);
+
+            IntPtr was = Marshal.ReadIntPtr(slot);
+            uint old;
+            bool reprotected = VirtualProtect(slot, (IntPtr)IntPtr.Size, PAGE_READWRITE, out old);
+            Marshal.WriteIntPtr(slot, thunk);
+            if (reprotected) VirtualProtect(slot, (IntPtr)IntPtr.Size, old, out old);
+            if (Marshal.ReadIntPtr(slot) != thunk) { Log(name + ": slot write did not stick"); return false; }
+
+            Log(name + ": slot 0x" + slot.ToString("x16") + " 0x" + was.ToString("x16")
+                + " -> 0x" + thunk.ToString("x16") + "  (void, handled by "
+                + handler.Method.DeclaringType + "." + handler.Method.Name + ")");
+            return true;
+        }
+
+        sealed class VoidCall
+        {
+            readonly string name;
+            readonly Action handler;
+
+            internal VoidCall(string name, Action handler) { this.name = name; this.handler = handler; }
+
+            internal void Call()
+            {
+                try { handler(); }
+                catch (Exception e) { Log(name + ": " + e.GetType().Name + ": " + e.Message); }
+            }
+        }
 
         static Type FindGameType()
         {

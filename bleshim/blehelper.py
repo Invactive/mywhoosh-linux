@@ -24,12 +24,21 @@ process without anything above it changing.
     <-  {"id":4,"ok":true}
     <-  {"ev":"value","addr":"AA:BB:...","char":"00002ad2-...","value":"44024a00..."}
 
-Ops: radios, scan, connect, disconnect, services, chars, read, write, notify.
-Events: advert, value, connection.
+Ops: radios, scan, connect, disconnect, services, chars, read, write, notify,
+mdns_browse, tcp_peer.  Events: advert, value, connection, mdns, mdns_lost.
+
+mdns_browse is not Bluetooth: it is how the game's OpenBikeControl discovery
+(BikeControl and friends, over Wi-Fi) reaches avahi-daemon -- see class Avahi.
+
+    ->  {"id":5,"op":"mdns_browse","type":"_openbikecontrol._tcp","enable":true}
+    <-  {"id":5,"ok":true}
+    <-  {"ev":"mdns","type":"_openbikecontrol._tcp","name":"BikeControl",
+         "host":"BikeControl.local","ip":"192.168.1.19","port":36870,...}
 
 Usage:
     ./blehelper.py                  # serve on 127.0.0.1:27019
     ./blehelper.py --list           # scan, print what is on the air, exit
+    ./blehelper.py --mdns           # browse _openbikecontrol._tcp, print, exit
     ./blehelper.py --port 27019 --adapter hci0
 
 Start it before the game; nothing has to be configured per trainer, because the
@@ -42,6 +51,7 @@ import argparse
 import errno
 import json
 import socket
+import struct
 import sys
 import time
 
@@ -56,6 +66,14 @@ ADAPTER_IFACE = "org.bluez.Adapter1"
 DEVICE_IFACE = "org.bluez.Device1"
 SERVICE_IFACE = "org.bluez.GattService1"
 CHAR_IFACE = "org.bluez.GattCharacteristic1"
+
+AVAHI = "org.freedesktop.Avahi"
+AVAHI_SERVER_IFACE = "org.freedesktop.Avahi.Server"
+AVAHI_BROWSER_IFACE = "org.freedesktop.Avahi.ServiceBrowser"
+AVAHI_RESOLVER_IFACE = "org.freedesktop.Avahi.ServiceResolver"
+AVAHI_IF_UNSPEC = -1
+AVAHI_PROTO_INET = 0
+OBC_SERVICE = "_openbikecontrol._tcp"
 
 CONNECT_TIMEOUT = 25          # seconds waiting for a link and its GATT tree
 ADVERT_TIMEOUT = 20           # seconds waiting for a named device to be on the air
@@ -321,11 +339,190 @@ class BleError(Exception):
     """Something the client asked for that the hardware would not do."""
 
 
+class Avahi:
+    """mDNS service discovery, through the host's avahi-daemon.
+
+    MyWhoosh finds OpenBikeControl devices (BikeControl, KICKR BIKE PRO ...)
+    by browsing `_openbikecontrol._tcp` with Apple Bonjour's COM objects, and
+    those are exactly what the Bonjour gate keeps it away from -- see
+    ../bleshim/CLAUDE.md.  So the browse happens here instead.  Not inside Wine:
+    the host's avahi-daemon already owns UDP 5353, and a second responder in
+    the prefix would fight it for every answer.  Avahi is on the system bus,
+    which this process is already on for BlueZ.
+
+    One report per service, however many interfaces it is seen on, and only
+    IPv4: OpenBikeManager::ServiceResolved keeps the first IPv4 address and
+    nothing else.
+
+    Each service is followed by an avahi ServiceResolver, which stays alive and
+    reports again whenever the answer changes -- the phone's DHCP lease moving
+    it to a new address, or the app coming back on a different port (BikeControl
+    walks to the next free one).  A changed answer goes out as a new `mdns`
+    event, and the shim offers the game the new address.
+    """
+
+    def __init__(self, bus, emit):
+        self.bus = bus
+        self.emit = emit                    # called with each event dict
+        self.browsers = {}                  # service type -> browser object path
+        self.seen = {}                      # (type, name) -> interface indexes listing it
+        self.resolvers = {}                 # resolver object path -> ((type, name), interface)
+        self.resolved = {}                  # (type, name) -> the event last reported
+        self.hooked = False
+
+    def server(self):
+        return dbus.Interface(self.bus.get_object(AVAHI, "/"), AVAHI_SERVER_IFACE)
+
+    def _hook(self):
+        # Subscribed by interface rather than by object path, and before any
+        # object exists: avahi starts work the moment ServiceBrowserNew or
+        # ServiceResolverNew returns, and a path-matched receiver added after
+        # that can miss the first signal.  The handlers filter by path instead.
+        if self.hooked:
+            return
+        for iface, member, fn in ((AVAHI_BROWSER_IFACE, "ItemNew", self._item_new),
+                                  (AVAHI_BROWSER_IFACE, "ItemRemove", self._item_remove),
+                                  (AVAHI_BROWSER_IFACE, "Failure", self._failure),
+                                  (AVAHI_RESOLVER_IFACE, "Found", self._found),
+                                  (AVAHI_RESOLVER_IFACE, "Failure", self._resolve_failed)):
+            self.bus.add_signal_receiver(fn, dbus_interface=iface,
+                                         signal_name=member, path_keyword="path")
+        self.hooked = True
+
+    def browse(self, stype):
+        if stype in self.browsers:
+            # A fresh browse is what Bonjour does on every OBC_StartScan, and it
+            # reports every service again; so does this.
+            for key, ev in list(self.resolved.items()):
+                if key[0] == stype:
+                    self.emit(ev)
+            return
+        self._hook()
+        try:
+            path = self.server().ServiceBrowserNew(dbus.Int32(AVAHI_IF_UNSPEC),
+                                                   dbus.Int32(AVAHI_PROTO_INET),
+                                                   stype, "local", dbus.UInt32(0))
+        except dbus.DBusException as e:
+            raise BleError("avahi-daemon is not reachable (%s) -- is it running?"
+                           % e.get_dbus_name())
+        self.browsers[stype] = str(path)
+        log("browsing %s", stype)
+
+    def _free(self, path, iface):
+        try:
+            dbus.Interface(self.bus.get_object(AVAHI, path), iface).Free()
+        except dbus.DBusException as e:
+            trace("%s.Free: %s", iface.rsplit(".", 1)[-1], e.get_dbus_name())
+
+    def stop(self, stype):
+        path = self.browsers.pop(stype, None)
+        for rpath, (key, _) in list(self.resolvers.items()):
+            if key[0] == stype:
+                del self.resolvers[rpath]
+                self._free(rpath, AVAHI_RESOLVER_IFACE)
+        for key in [k for k in self.seen if k[0] == stype]:
+            del self.seen[key]
+        for key in [k for k in self.resolved if k[0] == stype]:
+            del self.resolved[key]
+        if path is None:
+            return
+        self._free(path, AVAHI_BROWSER_IFACE)
+        log("stopped browsing %s", stype)
+
+    def stop_all(self):
+        for stype in list(self.browsers):
+            self.stop(stype)
+
+    def _type_of(self, path):
+        for stype, p in self.browsers.items():
+            if p == path:
+                return stype
+        return None
+
+    def _item_new(self, interface, protocol, name, stype, domain, flags, path=None):
+        mine = self._type_of(path)
+        if mine is None:
+            return
+        key = (mine, str(name))
+        self.seen.setdefault(key, set()).add(int(interface))
+        if any(v == (key, int(interface)) for v in self.resolvers.values()):
+            return
+        trace("mdns: %s on interface %d, resolving", name, interface)
+        try:
+            rpath = self.server().ServiceResolverNew(
+                interface, protocol, name, stype, domain,
+                dbus.Int32(AVAHI_PROTO_INET), dbus.UInt32(0))
+        except dbus.DBusException as e:
+            log("mdns: cannot resolve %s (%s)", name, e.get_dbus_message())
+            return
+        self.resolvers[str(rpath)] = (key, int(interface))
+
+    def _found(self, iface, protocol, name, stype, domain, host, aprotocol,
+               address, port, txt, flags, path=None):
+        entry = self.resolvers.get(path)
+        if entry is None:
+            return
+        key = entry[0]
+        try:
+            ifname = socket.if_indextoname(int(iface))
+        except OSError:
+            ifname = str(int(iface))
+        fields = {}
+        for item in txt:
+            k, _, v = bytes(bytearray(item)).decode("utf-8", "replace").partition("=")
+            fields[k] = v
+        ev = {"ev": "mdns", "type": key[0], "name": str(name), "host": str(host),
+              "ip": str(address), "port": int(port), "iface": ifname, "txt": fields}
+        before = self.resolved.get(key)
+        if before and (before["ip"], before["port"], before["host"]) == (ev["ip"], ev["port"], ev["host"]):
+            self.resolved[key] = ev         # a TXT refresh, or another interface: no news
+            return
+        self.resolved[key] = ev
+        if before:
+            log("mdns: %s moved from %s:%d to %s:%d (%s, %s)", name, before["ip"], before["port"],
+                address, port, host, ifname)
+        else:
+            log("mdns: %s at %s:%d (%s, %s)", name, address, port, host, ifname)
+        self.emit(ev)
+
+    def _resolve_failed(self, error, path=None):
+        entry = self.resolvers.get(path)
+        if entry is not None:
+            # Not final: the resolver keeps watching, and answers if the
+            # records come back.
+            log("mdns: cannot resolve %s yet (%s)", entry[0][1], error)
+
+    def _item_remove(self, interface, protocol, name, stype, domain, flags, path=None):
+        mine = self._type_of(path)
+        if mine is None:
+            return
+        key = (mine, str(name))
+        for rpath, v in list(self.resolvers.items()):
+            if v == (key, int(interface)):
+                del self.resolvers[rpath]
+                self._free(rpath, AVAHI_RESOLVER_IFACE)
+        ifaces = self.seen.get(key)
+        if ifaces is None:
+            return
+        ifaces.discard(int(interface))
+        if ifaces:
+            return
+        del self.seen[key]
+        if self.resolved.pop(key, None) is not None:
+            log("mdns: %s gone", name)
+            self.emit({"ev": "mdns_lost", "type": key[0], "name": str(name)})
+
+    def _failure(self, error, path=None):
+        if self._type_of(path) is not None:
+            log("mdns browse failed: %s", error)
+
+
 class Server:
     """One TCP client -- the game -- and the BlueZ state it asked for."""
 
-    def __init__(self, bluez, port):
+    def __init__(self, bluez, port, bus):
         self.bluez = bluez
+        self.avahi = Avahi(bus, self.send)
         self.port = port
         self.client = None
         self.buffer = b""
@@ -389,6 +586,7 @@ class Server:
         self.char_addr.clear()
         self.silent.clear()
         self.bluez.stop_scan()
+        self.avahi.stop_all()
 
     def on_data(self, conn, condition):
         if condition & (GLib.IO_HUP | GLib.IO_ERR):
@@ -502,6 +700,20 @@ class Server:
                 self.subscribed.discard((addr, char))
             return {}
 
+        if op == "mdns_browse":
+            stype = (req.get("type") or OBC_SERVICE).rstrip(".")
+            if req.get("enable"):
+                self.avahi.browse(stype)
+            else:
+                self.avahi.stop(stype)
+            return {}
+
+        if op == "tcp_peer":
+            try:
+                return {"connected": tcp_established(req.get("ip") or "", int(req.get("port") or 0))}
+            except (OSError, ValueError) as e:
+                raise BleError("tcp_peer: %s" % e)
+
         raise BleError("unknown op %r" % op)
 
     # --------------------------------------------------------------- events
@@ -611,18 +823,68 @@ def list_devices(bluez):
                                          " ".join(u[4:8] for u in uuids) or "no service UUIDs"))
 
 
+def tcp_established(ip, port):
+    """Does anything on this machine hold an established TCP connection to
+    ip:port?  The game's engine connects to an OpenBikeControl device itself,
+    over Winsock -- which under Wine is a plain Linux socket, so it is in
+    /proc/net/tcp like any other.  How the shim knows the game took an offer."""
+    v4 = "%08X:%04X" % (struct.unpack("<I", socket.inet_aton(ip))[0], port)
+    want = {"/proc/net/tcp": v4,
+            "/proc/net/tcp6": "0000000000000000FFFF0000" + v4}   # v4-mapped
+    for path, remote in want.items():
+        try:
+            with open(path) as f:
+                next(f, None)
+                for line in f:
+                    parts = line.split()
+                    if len(parts) > 3 and parts[2] == remote and parts[3] == "01":
+                        return True
+        except OSError:
+            pass
+    return False
+
+
+def list_mdns(bus, stype):
+    """Print the services avahi finds, so the network half can be checked
+    on its own -- the same browse the game's OBC_StartScan triggers."""
+    found = []
+    avahi = Avahi(bus, found.append)
+    try:
+        avahi.browse(stype)
+    except BleError as e:
+        raise SystemExit(str(e))
+    loop = GLib.MainLoop()
+    GLib.timeout_add_seconds(5, lambda: (loop.quit(), False)[1])
+    loop.run()
+    avahi.stop_all()
+    found = [ev for ev in found if ev["ev"] == "mdns"]
+    if not found:
+        print("no %s service found -- is the app running, on the same network,"
+              " with its network (mDNS) connection enabled?" % stype)
+        return
+    for ev in found:
+        print("%-24s %s:%d  host %s  on %s  %s" % (
+            ev["name"], ev["ip"], ev["port"], ev["host"], ev["iface"],
+            " ".join("%s=%s" % kv for kv in sorted(ev["txt"].items()))))
+
+
 def main():
     global verbose
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
     ap.add_argument("--port", type=int, default=27019, help="loopback port to serve on")
     ap.add_argument("--adapter", default="hci0", help="BlueZ adapter (default hci0)")
     ap.add_argument("--list", action="store_true", help="scan, print what is on the air, exit")
+    ap.add_argument("--mdns", nargs="?", const=OBC_SERVICE, metavar="TYPE",
+                    help="browse mDNS (default %s), print what answers, exit" % OBC_SERVICE)
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
     verbose = args.verbose
 
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     bus = dbus.SystemBus()
+    if args.mdns:
+        list_mdns(bus, args.mdns.rstrip("."))
+        return
     bluez = Bluez(bus, args.adapter)
     try:
         bluez.objects()
@@ -635,7 +897,7 @@ def main():
         list_devices(bluez)
         return
 
-    server = Server(bluez, args.port)
+    server = Server(bluez, args.port, bus)
     bus.add_signal_receiver(server.on_properties_changed,
                             dbus_interface=PROPS_IFACE,
                             signal_name="PropertiesChanged",
