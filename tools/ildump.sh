@@ -10,13 +10,14 @@ set -e
 cd "$(dirname "$0")"
 
 GAME_LIBS="${GAME_LIBS:-$HOME/Games/mywhoosh/drive_c/MyWhoosh/MyWhoosh/Binaries/Win64}"
-export WINEPREFIX="${WINEPREFIX:-$HOME/Games/mywhoosh}"
-# Lutris' own Wine, since that is what created the prefix; any Wine that runs
-# the game will do.
-WINE="${WINE:-$(ls -d "$HOME"/.local/share/lutris/runners/wine/*/bin/wine 2>/dev/null | tail -1)}"
-[ -x "$WINE" ] || WINE=wine
+# The Wine that made the prefix: any other one rewrites it on start (wine.sh).
+. ./wine.sh
+if [ -z "$WINE" ]; then
+    echo "no Wine matching $WINEPREFIX/version found; set WINE to the one that runs the game" >&2
+    exit 1
+fi
 
-[ -f ILDump.exe ] || mcs -out:ILDump.exe ILDump.cs
+[ -f ILDump.exe ] || { . ./mcs.sh; mcs -out:ILDump.exe ILDump.cs; }
 cp -f "$GAME_LIBS/WindowsConnectivity.dll" .
 
 WINEDEBUG=-all "$WINE" ILDump.exe WindowsConnectivity.dll "$@" 2>/dev/null

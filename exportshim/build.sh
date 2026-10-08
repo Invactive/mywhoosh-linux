@@ -4,6 +4,7 @@
 #   ./build.sh
 set -e
 cd "$(dirname "$0")"
+. ../tools/mcs.sh
 
 mkdir -p build
 mcs -target:library -platform:x64 -out:build/MyWhooshShim.dll ExportShim.cs

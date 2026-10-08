@@ -11,10 +11,11 @@
 # other into a prefix, never both.
 set -e
 cd "$(dirname "$0")"
+. ../tools/mcs.sh
 
 mkdir -p build
 
-mcs -target:library -out:build/Windows.dll src/Windows.cs src/Backend.cs src/Json.cs src/Loader.cs
+mcs -target:library -out:build/Windows.dll src/Windows.cs src/Backend.cs src/Json.cs src/Loader.cs src/OpenBike.cs
 
 # mcs refuses to name an assembly System.Runtime.WindowsRuntime (CS0281:
 # mscorlib grants that name friend access and we cannot sign with Microsoft's

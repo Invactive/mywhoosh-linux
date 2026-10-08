@@ -41,6 +41,24 @@ array by reference — the shape wine-mono cannot marshal, and the reason
 `../exportshim/` exists. `SigDump` measured the struct those four return: 64
 bytes under wine-mono.
 
+## Building them, and which Wine runs them
+
+`ildump.sh` runs in the game's prefix with **the prefix's own Wine**, found by
+`wine.sh` from `<prefix>/version` (Proton and umu write the runner's name
+there). Any other Wine rewrites the prefix as it starts (`wineboot -u`); set
+`WINE=` if the right one is somewhere `wine.sh` does not look.
+
+With no Mono on the host, `mcs.sh` supplies an `mcs` that runs wine-mono's
+`mcs.exe` from an installed Proton, in a scratch prefix of its own
+(`~/.cache/mywhoosh-linux/mcs-prefix`) — never the game's. The build scripts
+source it; so can a shell (`. tools/mcs.sh`). Pass relative paths: wine-mono
+reads `/home/...` as `C:\home\...`.
+
+ILDump resolves the game's references from its own directory (and
+`ILDUMP_PROBE`, `:`-separated — so a `Z:\...` path cannot go there). Methods
+that touch WinRT types, like `BluetoothSensor`'s, need `Windows.dll` and
+`System.Runtime.WindowsRuntime.dll` from `../bleshim/build/` copied beside it.
+
 ## Types — finding the class to look at
 
 `Types.cs` is the same idea, smaller: it lists every type in an assembly, which

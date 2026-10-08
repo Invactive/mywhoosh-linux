@@ -16,6 +16,7 @@
 # missing member is a MissingMethodException in the middle of a ride).
 set -e
 cd "$(dirname "$0")"
+. tools/mcs.sh       # the MANIFEST below asks mcs for its version
 
 tag=
 case "${1-}" in
