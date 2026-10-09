@@ -35,6 +35,7 @@ to build, and a Wine prefix with MyWhoosh already installed.
 WINEPREFIX=<prefix> ./install.sh             # copy them into the prefix
 WINEPREFIX=<prefix> ../exportshim/install.sh # and this one, see below
 WINEPREFIX=<prefix> ./install.sh --verify    # ... and check what a prefix has
+WINEPREFIX=<prefix> ./install.sh --lutris    # or: update a Lutris install's bleshim/
 ./run.sh                                     # start the helper + the game
 ```
 
