@@ -60,7 +60,7 @@ if ! newer "$latest" "$have"; then
 fi
 [ "${1:-}" = "--check" ] && { say "an update is available: run this without --check"; exit 0; }
 
-if pgrep -f 'MyWhoosh-Win64-Shipping|MyWhoosh\.exe' >/dev/null; then
+if pgrep -f '^[A-Za-z]:.*MyWhoosh(-Win64-Shipping)?[.]exe' >/dev/null; then
     say "MyWhoosh is running -- quit it first"
     exit 1
 fi

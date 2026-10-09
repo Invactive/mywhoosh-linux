@@ -112,6 +112,23 @@ ResolutionSizeY=1200
 Adding `-windowed -ResX=1920 -ResY=1200` to Lutris → *Configure* → *Game
 options* → *Arguments* makes the start windowed as well.
 
+## Installing a newer version of this support
+
+The installers download a release. To use a newer version from a checkout of
+this repository instead — or after `git pull` — build it and install it over
+the old one, with the game closed:
+
+```bash
+./bleshim/build.sh && ./exportshim/build.sh
+WINEPREFIX=~/Games/mywhoosh ./bleshim/install.sh --lutris
+```
+
+It stops a helper left running from the last session, copies the new files
+into `~/Games/mywhoosh/bleshim`, and ends with `--verify`'s report. No Mono on
+your computer is needed: the build uses the one inside a Proton.
+
+Reinstalling the game through Lutris would put the release's version back.
+
 ## Updating MyWhoosh
 
 There is no Microsoft Store under Wine to update the game. The install leaves a
@@ -124,7 +141,8 @@ Store package:
 ```
 
 Quit the game first. Your Wine prefix, settings and the Bluetooth support all
-stay: nothing of this project lives in the game's own files. If an update
+stay: nothing of this project lives in the game's own files, so there is
+nothing to reinstall after a game update. If an update
 changes the game's connectivity library, the script says so — check that
 Bluetooth and BikeControl still connect after the first launch.
 

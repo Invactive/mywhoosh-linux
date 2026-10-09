@@ -177,8 +177,14 @@ Newline-delimited JSON on `127.0.0.1:27019`, one client at a time.
   Replies carry the same `id`.
 - Unsolicited events carry `ev`: `advert`, `value`, `connection`, `mdns`
   (`type`, `name`, `host`, `ip`, `port`, `iface`, `txt`) and `mdns_lost`.
-- The helper serves requests one at a time, in order; a `connect` can hold it
-  for 20 s (see the rules above).
+- The helper serves requests in order, and answers a `connect` when it is done:
+  waiting for a sleeping trainer's advertisement (`ADVERT_TIMEOUT`, 20 s) and
+  BlueZ's `Connect()` run as main-loop callbacks, not nested loops, so every
+  other request is answered meanwhile. It used to block — and while a saved
+  trainer sleeps the game retries every ~25 s, so the helper was busy most of
+  the time, and the OpenBikeControl icon's re-browse waited 20 s behind it.
+  Scan state survives overlapping waits: `Bluez.wanted` (the client's) and
+  `Bluez.waiters` (connects that started a scan) decide when it stops.
 - The shim connects lazily and retries every 5 s, so starting the helper after
   the game still works.
 
@@ -291,7 +297,8 @@ hold up the trainer's notifications.
   reads the engine's socket out of `/proc/net/tcp` — Winsock under Wine is a
   plain Linux socket. A repeated `OBC_StartScan` (the OpenBikeControl icon on
   the connection screen) offers everything again, as a fresh Bonjour browse
-  would.
+  would — from `OpenBike.Known`, the shim's own record of what the helper has
+  reported, so the popup comes at once; the browse that follows confirms it.
 
 - The connection screen's OpenBikeControl icon first asks
   `WD_GetDirconServiceAvailability` — `WahooProgram::GetBonjourService`, "is a

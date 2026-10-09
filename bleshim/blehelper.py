@@ -79,6 +79,7 @@ CONNECT_TIMEOUT = 25          # seconds waiting for a link and its GATT tree
 ADVERT_TIMEOUT = 20           # seconds waiting for a named device to be on the air
 
 verbose = False
+DEFERRED = object()           # dispatch's "the reply comes later"
 
 
 def log(fmt, *a):
@@ -100,6 +101,8 @@ class Bluez:
         self.adapter_path = "/org/bluez/%s" % adapter
         self.om = dbus.Interface(bus.get_object(BLUEZ, "/"), OM_IFACE)
         self.scanning = False
+        self.wanted = False                 # the client asked for a scan
+        self.waiters = 0                    # connects waiting for an advertisement
 
     # --------------------------------------------------------------- lookup
 
@@ -174,87 +177,127 @@ class Bluez:
             trace("StopDiscovery: %s", e.get_dbus_name())
         log("scan stopped")
 
-    def wait_for_advert(self, addr, seconds):
-        """Scan until this device is on the air, whatever the client asked for.
+    def wait_for_advert(self, addr, seconds, then):
+        """Scan until this device is on the air, whatever the client asked for,
+        then call then(seen).
 
         The game connects to a device it saw in a scan it has since stopped, and
         a trainer drops its radio the moment the cranks stop turning.  Waiting
         here turns "connect failed" into "connect took a moment", and the scan
         state the client asked for is restored afterwards.
+
+        Asynchronous, like everything a connect does: a trainer that is asleep
+        costs ADVERT_TIMEOUT seconds, the game retries every ~25 s while it
+        sleeps, and the helper must go on answering everything else meanwhile
+        -- the radio check, the scan, OpenBikeControl's browse.
         """
         if self.on_air(addr):
-            return True
-        was_scanning = self.scanning
-        self.start_scan()
-        loop = GLib.MainLoop()
-        state = {"seen": False}
+            then(True)
+            return
+        if self.waiters == 0:
+            self.start_scan()
+        self.waiters += 1
+        state = {"done": False}
 
-        def poll():
-            if not self.on_air(addr):
-                return True
-            state["seen"] = True
-            loop.quit()
+        def finish(seen):
+            if state["done"]:
+                return False
+            state["done"] = True
+            self.waiters -= 1
+            if self.waiters == 0 and not self.wanted:
+                self.stop_scan()
+            then(seen)
             return False
 
+        def poll():
+            if state["done"]:
+                return False
+            if not self.on_air(addr):
+                return True
+            return finish(True)
+
         GLib.timeout_add(300, poll)
-        GLib.timeout_add_seconds(seconds, lambda: (loop.quit(), False)[1])
-        loop.run()
-        if not was_scanning:
-            self.stop_scan()
-        return state["seen"]
+        GLib.timeout_add_seconds(seconds, lambda: finish(False))
 
     # -------------------------------------------------------------- connect
 
-    def connect(self, addr):
+    def connect(self, addr, done):
         """Connect and wait for the GATT tree, the way WinRT's
-        FromBluetoothAddressAsync leaves a device ready to be walked."""
+        FromBluetoothAddressAsync leaves a device ready to be walked; then
+        done(name) or done(None, error).  Returns at once."""
         path = self.device_path(addr)
-        if path not in self.objects():
-            if not self.wait_for_advert(addr, ADVERT_TIMEOUT):
-                raise BleError("%s is not on the air (asleep, or out of range)" % addr)
 
-        props = dbus.Interface(self.bus.get_object(BLUEZ, path), PROPS_IFACE)
-        if not props.Get(DEVICE_IFACE, "Connected"):
-            if not self.on_air(addr) and not self.wait_for_advert(addr, ADVERT_TIMEOUT):
-                raise BleError("%s is not on the air (asleep, or out of range)" % addr)
-            dev = dbus.Interface(self.bus.get_object(BLUEZ, path), DEVICE_IFACE)
-            log("connecting to %s", addr)
-            try:
-                dev.Connect()
-            except dbus.DBusException as e:
-                raise BleError("Connect() failed: %s" % e.get_dbus_message())
+        def fail(why):
+            done(None, why)
 
-        try:
-            # An untrusted device is one BlueZ will not let reconnect on its
-            # own, and a trainer that sleeps between intervals needs to.
-            if not props.Get(DEVICE_IFACE, "Trusted"):
-                props.Set(DEVICE_IFACE, "Trusted", dbus.Boolean(True))
-        except dbus.DBusException:
-            pass
-
-        loop = GLib.MainLoop()
-        state = {"ok": False}
-
-        def resolved():
-            try:
-                if not props.Get(DEVICE_IFACE, "ServicesResolved"):
-                    return True
-            except dbus.DBusException:
-                loop.quit()
+        def guarded(step):
+            # Each step runs from the main loop; nothing may escape it.
+            def run(*a):
+                try:
+                    step(*a)
+                except dbus.DBusException as e:
+                    fail(e.get_dbus_message() or e.get_dbus_name())
+                except BleError as e:
+                    fail(str(e))
                 return False
-            state["ok"] = True
-            loop.quit()
-            return False
+            return run
 
-        GLib.timeout_add(300, resolved)
-        GLib.timeout_add_seconds(CONNECT_TIMEOUT, lambda: (loop.quit(), False)[1])
-        loop.run()
-        if not state["ok"]:
-            raise BleError("connected to %s but its services never resolved" % addr)
+        def props():
+            return dbus.Interface(self.bus.get_object(BLUEZ, path), PROPS_IFACE)
 
-        name = str(self.device_props(addr).get("Alias", "") or "")
-        log("%s connected as %r", addr, name)
-        return name
+        @guarded
+        def start():
+            if path not in self.objects():
+                self.wait_for_advert(addr, ADVERT_TIMEOUT, guarded(after_known))
+            else:
+                after_known(True)
+
+        def after_known(seen):
+            if not seen:
+                raise BleError("%s is not on the air (asleep, or out of range)" % addr)
+            if props().Get(DEVICE_IFACE, "Connected"):
+                connected()
+            elif self.on_air(addr):
+                link()
+            else:
+                self.wait_for_advert(addr, ADVERT_TIMEOUT, guarded(after_air))
+
+        def after_air(seen):
+            if not seen:
+                raise BleError("%s is not on the air (asleep, or out of range)" % addr)
+            link()
+
+        def link():
+            log("connecting to %s", addr)
+            dbus.Interface(self.bus.get_object(BLUEZ, path), DEVICE_IFACE).Connect(
+                reply_handler=guarded(connected),
+                error_handler=lambda e: fail("Connect() failed: %s" % e.get_dbus_message()),
+                timeout=CONNECT_TIMEOUT + 10)
+
+        def connected():
+            try:
+                # An untrusted device is one BlueZ will not let reconnect on
+                # its own, and a trainer that sleeps between intervals needs to.
+                if not props().Get(DEVICE_IFACE, "Trusted"):
+                    props().Set(DEVICE_IFACE, "Trusted", dbus.Boolean(True))
+            except dbus.DBusException:
+                pass
+            deadline = time.monotonic() + CONNECT_TIMEOUT
+
+            @guarded
+            def resolved():
+                if props().Get(DEVICE_IFACE, "ServicesResolved"):
+                    name = str(self.device_props(addr).get("Alias", "") or "")
+                    log("%s connected as %r", addr, name)
+                    done(name)
+                elif time.monotonic() > deadline:
+                    fail("connected to %s but its services never resolved" % addr)
+                else:
+                    GLib.timeout_add(300, resolved)
+
+            resolved()
+
+        start()
 
     def disconnect(self, addr):
         path = self.device_path(addr)
@@ -585,6 +628,7 @@ class Server:
         self.subscribed.clear()
         self.char_addr.clear()
         self.silent.clear()
+        self.bluez.wanted = False
         self.bluez.stop_scan()
         self.avahi.stop_all()
 
@@ -640,6 +684,8 @@ class Server:
             log("%s: %s", op, e.get_dbus_message())
             self.send({"id": rid, "ok": False, "error": e.get_dbus_message()})
             return
+        if reply is DEFERRED:
+            return
         reply = dict(reply or {})
         reply.update({"id": rid, "ok": True})
         self.send(reply)
@@ -652,17 +698,31 @@ class Server:
             return {"radios": self.bluez.radios()}
 
         if op == "scan":
-            if req.get("enable"):
+            self.bluez.wanted = bool(req.get("enable"))
+            if self.bluez.wanted:
                 self.bluez.start_scan()
                 self.announce_known()
-            else:
-                self.bluez.stop_scan()
+            elif self.bluez.waiters == 0:
+                self.bluez.stop_scan()      # else the last waiting connect stops it
             return {}
 
         if op == "connect":
-            name = self.bluez.connect(addr)
-            self.connected[addr] = True
-            return {"name": name}
+            # Answered later, by the connect itself; meanwhile the helper goes
+            # on serving the client's other requests.
+            client, rid = self.client, req.get("id")
+
+            def done(name, error=None):
+                if self.client is not client:
+                    return                  # that client is gone
+                if error:
+                    log("connect: %s", error)
+                    self.send({"id": rid, "ok": False, "error": error})
+                    return
+                self.connected[addr] = True
+                self.send({"id": rid, "ok": True, "name": name})
+
+            self.bluez.connect(addr, done)
+            return DEFERRED
 
         if op == "disconnect":
             for key in [k for k in self.subscribed if k[0] == addr]:

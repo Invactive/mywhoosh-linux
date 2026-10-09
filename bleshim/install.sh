@@ -4,6 +4,13 @@
 #   WINEPREFIX=<prefix> ./install.sh
 #   WINEPREFIX=<prefix> ./install.sh --verify     # also: SHIM_DIR=<dir>
 #   WINEPREFIX=<prefix> ./install.sh --restore
+#   WINEPREFIX=<prefix> ./install.sh --lutris     # also: SHIM_DIR=<dir>
+#
+# --lutris updates an install made by the Lutris installer, which keeps
+# everything in $GAMEDIR/bleshim (= <prefix>/bleshim) and points mono at it with
+# MONO_PATH: this build's assemblies, the helper and the Lutris scripts, copied
+# over the old ones.  The game must be closed; a helper still running from the
+# last session is stopped, or Lutris would go on using the old one.
 #
 # The assemblies go in the prefix's own wine-mono tree, never in the game
 # directory: MyWhoosh hashes WindowsConnectivity.dll and silently declines to
@@ -34,7 +41,7 @@ TARGET="$WINEPREFIX/drive_c/windows/mono/mono-2.0/lib"
 SHIM="Windows.dll System.Runtime.WindowsRuntime.dll"
 
 [ -d "$WINEPREFIX/drive_c" ] || { echo "no prefix at $WINEPREFIX" >&2; exit 1; }
-if [ "${1:-}" != "--verify" ] && [ ! -d "$TARGET" ]; then
+if [ "${1:-}" != "--verify" ] && [ "${1:-}" != "--lutris" ] && [ ! -d "$TARGET" ]; then
     echo "no wine-mono in $WINEPREFIX (expected $TARGET)" >&2
     echo "a Proton prefix has none: install with the Lutris installer, which uses MONO_PATH" >&2
     exit 1
@@ -197,6 +204,35 @@ case "${1:-}" in
     report_gate
     verify_obc "$first"
     exit 0
+    ;;
+--lutris)
+    dir="${SHIM_DIR:-$WINEPREFIX/bleshim}"
+    [ -d "$dir" ] || { echo "no $dir -- was this prefix installed with the Lutris installer?" >&2; exit 1; }
+    if pgrep -f '^[A-Za-z]:.*MyWhoosh(-Win64-Shipping)?[.]exe' >/dev/null; then
+        echo "MyWhoosh is running -- quit it first" >&2
+        exit 1
+    fi
+    for dll in $SHIM; do [ -f "build/$dll" ] || { ./build.sh; break; }; done
+    [ -f ../exportshim/build/MyWhooshShim.dll ] || ../exportshim/build.sh
+
+    # The old helper serves the old protocol; the next launch must start this one.
+    if pgrep -f "$dir/blehelper.py" >/dev/null; then
+        "$dir/mywhoosh-ble.sh" stop >/dev/null 2>&1 || true
+        pkill -f "$dir/blehelper.py" 2>/dev/null || true
+        echo "  stopped the helper left running from the last session"
+    fi
+
+    # Replaced by rename, not rewritten in place: a file something still has
+    # mapped keeps its old contents instead of changing under it.
+    for f in build/Windows.dll build/System.Runtime.WindowsRuntime.dll \
+             ../exportshim/build/MyWhooshShim.dll blehelper.py \
+             ../lutris/mywhoosh-ble.sh ../lutris/mywhoosh-update.sh; do
+        install -m 0755 "$f" "$dir/.installing"
+        mv -f "$dir/.installing" "$dir/$(basename "$f")"
+        echo "  installed $dir/$(basename "$f")"
+    done
+    echo
+    exec ./install.sh --verify     # we are in its directory
     ;;
 --restore)
     [ -d ../winmd/build ] || { echo "../winmd is not built; run ../winmd/build.sh" >&2; exit 1; }

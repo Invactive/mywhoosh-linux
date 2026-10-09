@@ -82,6 +82,10 @@ namespace MyWhoosh.Ble
         // again only after losing it, or on a fresh Browse -- plus re-offers.
         static readonly Dictionary<string, Offer> Offers = new Dictionary<string, Offer>();
         static readonly List<BackendEvent> Outbox = new List<BackendEvent>();
+        // Every service the helper has reported and not since lost, scanning
+        // or not: what a tap on the OpenBikeControl icon is answered from, at
+        // once -- the helper may be busy, and the popup has to come now.
+        static readonly Dictionary<string, BackendEvent> Known = new Dictionary<string, BackendEvent>();
         static bool saidNoCallback;
         static bool dirty;                  // something for the worker since it last looked
         static readonly int ReofferSeconds = ReadReoffer();
@@ -111,7 +115,7 @@ namespace MyWhoosh.Ble
                         if (DateTime.UtcNow - lastStart < TimeSpan.FromSeconds(2)) return;
                         lastStart = DateTime.UtcNow;
                         Backend.Log("obc: game called OBC_StartScan again -- offering every service again");
-                        Offers.Clear();
+                        OfferKnown();
                         rebrowse = true;
                         Wake();
                         return;
@@ -119,7 +123,7 @@ namespace MyWhoosh.Ble
                     Backend.Log("obc: game called OBC_StartScan -- browsing " + ServiceType);
                     scanning = true;
                     lastStart = DateTime.UtcNow;
-                    Offers.Clear();
+                    OfferKnown();
                     Wake();
                 }
             }
@@ -193,6 +197,20 @@ namespace MyWhoosh.Ble
             catch (Exception e) { Backend.Log("obc: Hooked: " + e); }
         }
 
+        /// A fresh browse: forget what was offered, and offer everything known
+        /// now.  The browse that follows confirms it, or reports what moved.
+        /// Caller holds Gate.
+        static void OfferKnown()
+        {
+            Offers.Clear();
+            Outbox.Clear();
+            foreach (BackendEvent ev in Known.Values)
+            {
+                Offers[ev.Name] = new Offer { Ev = ev, Where = ev.Ip + ":" + ev.Port, Last = DateTime.UtcNow };
+                Outbox.Add(ev);
+            }
+        }
+
         /// Start the worker if need be and let it look at the state.
         /// Caller holds Gate.
         static void Wake()
@@ -220,11 +238,14 @@ namespace MyWhoosh.Ble
             {
                 if (ev.Kind == "mdns_lost")
                 {
+                    Known.Remove(ev.Name);
                     if (Offers.Remove(ev.Name))
                         Backend.Log("obc: " + ev.Name + " is gone (the game is not told: ServiceLost is empty)");
                     return;
                 }
-                if (ev.Kind != "mdns" || !scanning) return;
+                if (ev.Kind != "mdns") return;
+                Known[ev.Name] = ev;
+                if (!scanning) return;
 
                 // The same service at a new address or port -- BikeControl moves
                 // to the next port when its own is taken -- is news; the same
@@ -277,6 +298,10 @@ namespace MyWhoosh.Ble
                 }
             }
 
+            // Deliveries first: the helper may be slow to answer, the popup may not.
+            if (due != null)
+                foreach (BackendEvent ev in due) Deliver(ev);
+
             if (want && (again || have < 0 || have != Backend.Generation))
             {
                 if (Backend.Call("op", "mdns_browse", "type", ServiceType, "enable", true) != null)
@@ -291,9 +316,6 @@ namespace MyWhoosh.Ble
                     Backend.Call("op", "mdns_browse", "type", ServiceType, "enable", false);
                 lock (Gate) browsedOn = -1;
             }
-
-            if (due != null)
-                foreach (BackendEvent ev in due) Deliver(ev);
 
             if (want && ReofferSeconds > 0) Reoffer();
         }
