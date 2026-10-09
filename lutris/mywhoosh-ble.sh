@@ -5,6 +5,11 @@
 #   mywhoosh-ble.sh start     Lutris' pre-launch script
 #   mywhoosh-ble.sh stop      Lutris' post-exit script
 #
+# `start` also asks the Microsoft Store whether a newer MyWhoosh exists, in the
+# background, and says so with a desktop notification -- nothing updates the
+# game under Wine, and the game's own "new version" popup leads nowhere.
+# MYWHOOSH_UPDATE_CHECK=0 turns that off.
+#
 # The installer copies this next to blehelper.py inside the game directory and
 # points the game's prelaunch_command/postexit_command at it, so a user starts
 # MyWhoosh from Lutris and the helper comes and goes with it.  Without the
@@ -166,6 +171,27 @@ shim_reachable() {
     [ -f "$MONO_TREE/mono/4.5/mscorlib.dll" ] && [ -f "$MONO_TREE/Windows.dll" ]
 }
 
+# Ask mywhoosh-update.sh whether the Store has a newer MyWhoosh -- detached,
+# because the Store can take a while to answer and the game must not wait for
+# it.  It only ever checks: downloading several GB unasked, or replacing game
+# files while the game starts, is not something to do behind anyone's back.
+update_check() {
+    local updater="$DIR/mywhoosh-update.sh"
+    [ "${MYWHOOSH_UPDATE_CHECK:-1}" = 0 ] && return
+    [ -f "$updater" ] || return
+    # Through the host under Flatpak, like the helper: curl and python3 there.
+    setsid nohup bash -c '
+        out=$(timeout 120 $1 bash "$2" --check 2>&1)
+        printf "%s\n" "$out" >> "$3"
+        case "$out" in
+        *"update is available"*)
+            ver=$(printf "%s\n" "$out" | sed -n "s/.*Store has \(.*\)/\1/p" | head -1)
+            $1 notify-send -a MyWhoosh -i dialog-information \
+                "MyWhoosh $ver is available" \
+                "After riding, quit the game and run: $2" ;;
+        esac' _ "$HOST" "$updater" "$LOG" > /dev/null 2>&1 < /dev/null &
+}
+
 notify() {
     # Through the host as well: the Flatpak runtime may have no notify-send,
     # and the manifest asks for no notification name on the session bus.
@@ -212,6 +238,7 @@ start)
     # (a sensor that never appears) are read after quitting the game.
     [ -f "$LOG" ] && mv -f "$LOG" "$LOG.prev" 2>/dev/null
     say "log: $LOG"
+    update_check
 
     # Not a Bluetooth problem but a fatal one: without the shim the game dies
     # at its first Bluetooth call, with a TypeLoadException naming `Windows`.

@@ -140,6 +140,11 @@ Store package:
 ~/Games/mywhoosh/bleshim/mywhoosh-update.sh           # download and install it
 ```
 
+Each launch from Lutris also asks the Store in the background, and shows a
+desktop notification when a newer version is out (the game's own "new version"
+popup cannot install anything under Wine). It never downloads by itself; set
+`MYWHOOSH_UPDATE_CHECK=0` in Lutris' environment variables to turn it off.
+
 Quit the game first. Your Wine prefix, settings and the Bluetooth support all
 stay: nothing of this project lives in the game's own files, so there is
 nothing to reinstall after a game update. If an update
