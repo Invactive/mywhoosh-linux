@@ -370,12 +370,16 @@ class Bluez:
             raise BleError("ReadValue failed: %s" % e.get_dbus_message())
         return bytes(bytearray(value))
 
-    def write(self, addr, char_uuid, value, with_response):
+    def write(self, addr, char_uuid, value, with_response, done):
+        """Write, then done(None) or done(error).  Returns at once: a write
+        with response waits for the trainer's answer, which on a poor link
+        takes seconds, and the helper has notifications to forward meanwhile
+        -- power, cadence, heart rate."""
         options = {"type": "request" if with_response else "command"}
-        try:
-            self.char(addr, char_uuid).WriteValue(dbus.Array(value, signature="y"), options)
-        except dbus.DBusException as e:
-            raise BleError("WriteValue failed: %s" % e.get_dbus_message())
+        self.char(addr, char_uuid).WriteValue(
+            dbus.Array(value, signature="y"), options,
+            reply_handler=lambda: done(None),
+            error_handler=lambda e: done("WriteValue failed: %s" % e.get_dbus_message()))
 
     def notify(self, addr, char_uuid, enable):
         char = self.char(addr, char_uuid)
@@ -763,8 +767,19 @@ class Server:
 
         if op == "write":
             value = bytes.fromhex(req.get("value") or "")
-            self.bluez.write(addr, char, value, bool(req.get("response", True)))
-            return {}
+            client, rid = self.client, req.get("id")
+
+            def written(error):
+                if self.client is not client:
+                    return
+                if error:
+                    log("write %s on %s: %s", char, addr, error)
+                    self.send({"id": rid, "ok": False, "error": error})
+                else:
+                    self.send({"id": rid, "ok": True})
+
+            self.bluez.write(addr, char, value, bool(req.get("response", True)), written)
+            return DEFERRED
 
         if op == "notify":
             enable = bool(req.get("enable"))

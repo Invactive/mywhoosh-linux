@@ -152,6 +152,25 @@ check is the only `Task.Wait` in the assembly. So the connect runs on a pool
 thread and the game's connect sequence continues there, as on Windows.
 `MYWHOOSH_BLE_INLINE_CONNECT=1` restores the old behaviour.
 
+**Writes are the same case.** Every grade change (`BT_WriteGrade` →
+`BluetoothSensor::WriteGrade`) and ERG target (`BT_SetERGPower` →
+`SetERGTargetPower`) goes through `ExtensionMethods::Await` from the game's
+thread, and `WriteBytes` only awaits the write. Inline, each held the game for
+a Bluetooth round trip — short stutters on a good link, seconds on a poor one.
+They now run on a pool thread, through a per-device queue
+(`BluetoothLEDevice.Serial`): in order, so a later grade never lands before an
+earlier one, and one at a time, because BlueZ refuses a second write request on
+a characteristic with one in flight. A write over 500 ms is logged — the first
+sign of a degrading link. The helper writes asynchronously too, so
+notifications keep flowing while the trainer answers.
+`MYWHOOSH_BLE_INLINE_WRITE=1` restores the old behaviour.
+
+**Link drops below BlueZ.** On this laptop's MediaTek MT7921 (one radio shared
+by Wi-Fi and Bluetooth) the kernel logs `ACL packet for unknown connection
+handle` exactly when a sensor drops: the controller lost the link, not BlueZ
+or this code. The game reconnects; the helper joins concurrent connects to one
+device so the second does not fail with "Operation already in progress".
+
 **The game's thread never waits long for the helper.** The helper is
 single-threaded, so while it connects, everything else queues behind it —
 including the radio query (`BT_GetModuleState` → `IsBluetoothEnabled`) and scan

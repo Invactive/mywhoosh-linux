@@ -82,6 +82,12 @@ namespace Windows.Foundation
         /// BluetoothLEDevice.FromBluetoothAddressAsync.  Never faults: a
         /// failure is the default result, which is how every operation here
         /// reports one.
+        /// An operation finished by a Task someone else runs (Device.Serial).
+        internal IAsyncOperation(Task<TResult> task)
+        {
+            Task = task;
+        }
+
         internal IAsyncOperation(Func<TResult> work, string what)
         {
             Task = System.Threading.Tasks.Task.Run(() =>
@@ -269,6 +275,33 @@ namespace Windows.Devices.Bluetooth
         internal readonly string Address;       // "AA:BB:CC:DD:EE:FF"
         string name;
         bool connected = true;
+
+        // Writes to this device, one after another, off the caller's thread.
+        // See GattCharacteristic.WriteValueAsync for why.
+        readonly object serialGate = new object();
+        Task serialTail = Task.FromResult(0);
+
+        /// Run work after every earlier one for this device, on a pool thread.
+        /// In order, because a grade or an ERG target sent later must land
+        /// later; one at a time, because BlueZ refuses a second write request
+        /// to a characteristic while one is in flight.
+        internal Task<T> Serial<T>(Func<T> work, T onFailure, string what)
+        {
+            lock (serialGate)
+            {
+                Task<T> next = serialTail.ContinueWith(_ =>
+                {
+                    try { return work(); }
+                    catch (Exception e)
+                    {
+                        Backend.Log(what + " failed: " + e.Message);
+                        return onFailure;
+                    }
+                }, TaskScheduler.Default);
+                serialTail = next;
+                return next;
+            }
+        }
 
         static readonly Dictionary<string, BluetoothLEDevice> Live =
             new Dictionary<string, BluetoothLEDevice>(StringComparer.OrdinalIgnoreCase);
@@ -730,29 +763,52 @@ namespace Windows.Devices.Bluetooth.GenericAttributeProfile
                 new GattReadResult(GattCommunicationStatus.Success, value));
         }
 
+        /// Writes do not complete inline: they are queued per device and done
+        /// on a pool thread.  The game writes from its own thread while riding
+        /// -- every grade change (BT_WriteGrade -> BluetoothSensor::WriteGrade)
+        /// and ERG target (BT_SetERGPower -> SetERGTargetPower) -- through
+        /// ExtensionMethods::Await, async void, and awaits the result only
+        /// inside WriteBytes' own state machine.  Inline, each write held the
+        /// game for a whole Bluetooth round trip: tens of ms on a good link,
+        /// seconds on a poor one, the 40 s call timeout on a dropped one.
+        /// MYWHOOSH_BLE_INLINE_WRITE=1 restores the old behaviour.
         public Foundation.IAsyncOperation<GattCommunicationStatus> WriteValueAsync(Storage.Streams.IBuffer value)
         {
-            return new Foundation.IAsyncOperation<GattCommunicationStatus>(Write(value));
+            if (InlineWrites) return new Foundation.IAsyncOperation<GattCommunicationStatus>(Write(Json.ToHex(Bytes.Of(value))));
+            string hex = Json.ToHex(Bytes.Of(value));       // now, not when the queue gets to it
+            return new Foundation.IAsyncOperation<GattCommunicationStatus>(
+                device.Serial(() => Write(hex), GattCommunicationStatus.Unreachable, "write to " + uuid));
         }
 
         public Foundation.IAsyncOperation<GattWriteResult> WriteValueWithResultAsync(Storage.Streams.IBuffer value)
         {
-            return new Foundation.IAsyncOperation<GattWriteResult>(new GattWriteResult(Write(value)));
+            if (InlineWrites) return new Foundation.IAsyncOperation<GattWriteResult>(new GattWriteResult(Write(Json.ToHex(Bytes.Of(value)))));
+            string hex = Json.ToHex(Bytes.Of(value));
+            return new Foundation.IAsyncOperation<GattWriteResult>(
+                device.Serial(() => new GattWriteResult(Write(hex)),
+                              new GattWriteResult(GattCommunicationStatus.Unreachable), "write to " + uuid));
         }
+
+        static readonly bool InlineWrites = Environment.GetEnvironmentVariable("MYWHOOSH_BLE_INLINE_WRITE") == "1";
 
         /// WinRT's plain WriteValueAsync writes *with* response, and so does
         /// this -- except for a characteristic that cannot take one, where
         /// asking for a response is a guaranteed failure rather than a safer
         /// default.
-        GattCommunicationStatus Write(Storage.Streams.IBuffer value)
+        GattCommunicationStatus Write(string hex)
         {
             bool withResponse = (properties & GattCharacteristicProperties.Write) != 0
                              || (properties & GattCharacteristicProperties.WriteWithoutResponse) == 0;
+            var timer = System.Diagnostics.Stopwatch.StartNew();
             var reply = Backend.Call("op", "write",
                                      "addr", device.Address,
                                      "char", uuid.ToString("D"),
-                                     "value", Json.ToHex(Bytes.Of(value)),
+                                     "value", hex,
                                      "response", withResponse);
+            // A slow link shows here first, long before it drops.
+            if (timer.ElapsedMilliseconds > 500)
+                Backend.Log("write to " + uuid + " on " + device.Address + " took "
+                            + timer.ElapsedMilliseconds + " ms");
             return reply == null ? GattCommunicationStatus.Unreachable : GattCommunicationStatus.Success;
         }
 
