@@ -103,6 +103,7 @@ class Bluez:
         self.scanning = False
         self.wanted = False                 # the client asked for a scan
         self.waiters = 0                    # connects waiting for an advertisement
+        self.connecting = {}                # addr -> callbacks of the connect in flight
 
     # --------------------------------------------------------------- lookup
 
@@ -224,11 +225,26 @@ class Bluez:
     def connect(self, addr, done):
         """Connect and wait for the GATT tree, the way WinRT's
         FromBluetoothAddressAsync leaves a device ready to be walked; then
-        done(name) or done(None, error).  Returns at once."""
+        done(name) or done(None, error).  Returns at once.
+
+        One connect per device at a time.  The game asks twice when a sensor
+        drops (its reconnect, and the pairing screen's), and two Device1.Connect()
+        calls in flight make BlueZ refuse the second -- "Operation already in
+        progress" -- which reads to the game as the sensor being gone.  So a
+        second request joins the first and gets its answer."""
+        if addr in self.connecting:
+            trace("connect %s: already in progress, joining it", addr)
+            self.connecting[addr].append(done)
+            return
+        self.connecting[addr] = [done]
         path = self.device_path(addr)
 
+        def finish(name, error=None):
+            for cb in self.connecting.pop(addr, []):
+                cb(name, error)
+
         def fail(why):
-            done(None, why)
+            finish(None, why)
 
         def guarded(step):
             # Each step runs from the main loop; nothing may escape it.
@@ -289,7 +305,7 @@ class Bluez:
                 if props().Get(DEVICE_IFACE, "ServicesResolved"):
                     name = str(self.device_props(addr).get("Alias", "") or "")
                     log("%s connected as %r", addr, name)
-                    done(name)
+                    finish(name)
                 elif time.monotonic() > deadline:
                     fail("connected to %s but its services never resolved" % addr)
                 else:
